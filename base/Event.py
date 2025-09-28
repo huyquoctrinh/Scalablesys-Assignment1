@@ -25,6 +25,9 @@ class Event:
         if self.probability is not None and (self.probability < 0.0 or self.probability > 1.0):
             raise Exception("Invalid value for probability:%s" % (self.probability,))
         Event.counter += 1
+    
+    def get_data(self):
+        print("Event.get_data() called:", self.payload)
 
     def __eq__(self, other):
         return self.payload[Event.INDEX_ATTRIBUTE_NAME] == other.payload[Event.INDEX_ATTRIBUTE_NAME]

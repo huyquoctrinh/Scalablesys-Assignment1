@@ -8,18 +8,7 @@ from parallel.ParallelExecutionParameters import ParallelExecutionParameters
 from stream.Stream import InputStream, OutputStream
 from base.Pattern import Pattern
 # Try alternative import paths for EvaluationMechanismParameters
-try:
-    from evaluation.EvaluationMechanismFactory import EvaluationMechanismParameters
-except ImportError:
-    try:
-        from evaluation.EvaluationMechanismParameters import EvaluationMechanismParameters
-    except ImportError:
-        try:
-            from evaluation import EvaluationMechanismParameters
-        except ImportError:
-            # Define a simple placeholder if not found
-            EvaluationMechanismParameters = None
-            print("Warning: EvaluationMechanismParameters not found, using None as default")
+from evaluation.EvaluationMechanismFactory import EvaluationMechanismParameters
 
 from typing import List, Optional
 from datetime import datetime
@@ -27,16 +16,12 @@ from transformation.PatternPreprocessingParameters import PatternPreprocessingPa
 from transformation.PatternPreprocessor import PatternPreprocessor
 
 # Load shedding imports
-try:
-    from loadshedding import (
-        LoadSheddingConfig, LoadMonitor, LoadSheddingStrategy, 
-        ProbabilisticLoadShedding, SemanticLoadShedding, AdaptiveLoadShedding, NoLoadShedding,
-        LoadSheddingMetrics, LoadAwareInputStream, AdaptivePatternManager
-    )
-    LOAD_SHEDDING_AVAILABLE = True
-except ImportError:
-    LOAD_SHEDDING_AVAILABLE = False
-    print("Load shedding module not available. Running without load shedding support.")
+from loadshedding import (
+    LoadSheddingConfig, LoadMonitor, LoadSheddingStrategy, 
+    ProbabilisticLoadShedding, SemanticLoadShedding, AdaptiveLoadShedding, NoLoadShedding,
+    LoadSheddingMetrics, LoadAwareInputStream, AdaptivePatternManager
+)
+LOAD_SHEDDING_AVAILABLE = True
 
 
 class CEP:
@@ -125,14 +110,22 @@ class CEP:
         
         # Wrap input stream with load shedding if enabled
         if self.__load_shedding_enabled:
+            print("Enable load shedding for this CEP run")
             events = self._wrap_with_load_shedding(events)
             self.__metrics_collector.start_collection()
         
-        try:
-            self.__evaluation_manager.eval(events, matches, data_formatter)
-        finally:
-            if self.__load_shedding_enabled:
-                self.__metrics_collector.stop_collection()
+        # try:
+        print("Starting evaluation...")
+        print(f"Evaluation manager type: {type(self.__evaluation_manager)}")
+        print(f"Events type: {type(events)}")
+        print(f"Matches type: {type(matches)}")
+        print(f"Data formatter type: {type(data_formatter)}")
+        
+        self.__evaluation_manager.eval(events, matches, data_formatter)
+        print("Evaluation completed!")
+        # finally:
+        #     if self.__load_shedding_enabled:
+        #         self.__metrics_collector.stop_collection()
         
         return (datetime.now() - start).total_seconds()
     
@@ -149,10 +142,10 @@ class CEP:
         """
         Returns one match from the output stream.
         """
-        try:
-            return self.get_pattern_match_stream().get_item()
-        except StopIteration:  # the stream might be closed.
-            return None
+        # try:
+        return self.get_pattern_match_stream().get_item()
+        # except StopIteration:  # the stream might be closed.
+            # return None
 
     def get_pattern_match_stream(self):
         """

@@ -54,7 +54,7 @@ class CitiBikeCSVFormatter:
 
 if __name__ == "__main__":
     # Example usage
-    formatter = CitiBikeCSVFormatter("201309-citibike-tripdata.csv")
+    formatter = CitiBikeCSVFormatter("201306-citibike-tripdata.csv")
     for event in formatter:
         print(event)
 

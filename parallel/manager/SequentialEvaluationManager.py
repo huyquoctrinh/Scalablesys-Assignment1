@@ -25,8 +25,12 @@ class SequentialEvaluationManager(EvaluationManager):
         self.__pattern_matches = None
 
     def eval(self, event_stream: InputStream, pattern_matches: OutputStream, data_formatter: DataFormatter):
+        print(f"SequentialEvaluationManager.eval() called")
+        print(f"Evaluation mechanism type: {type(self.__eval_mechanism)}")
         self.__pattern_matches = pattern_matches
+        print("Calling eval_mechanism.eval()...")
         self.__eval_mechanism.eval(event_stream, pattern_matches, data_formatter)
+        print("eval_mechanism.eval() completed!")
 
     def get_pattern_match_stream(self):
         return self.__pattern_matches
