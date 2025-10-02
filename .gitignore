@@ -1,3 +1,5 @@
 gignore/
 *.pyc
 __pycache__/
+project_results
+comprehensive_demo.log
