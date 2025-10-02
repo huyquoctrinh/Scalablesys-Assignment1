@@ -1,1 +1,3 @@
-llm.md
+gignore/
+*.pyc
+__pycache__/
