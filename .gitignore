@@ -3,3 +3,5 @@ gignore/
 __pycache__/
 project_results
 comprehensive_demo.log
+test_data/
+test_data_split/

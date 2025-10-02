@@ -9,8 +9,12 @@ import sys
 import time
 import logging
 from datetime import datetime, timedelta
-from typing import List, Iterator, Dict
+from typing import List, Iterator, Dict, Union
 import statistics
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
+import glob
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -46,76 +50,175 @@ LOAD_SHEDDING_AVAILABLE = True
 
 
 class EnhancedCitiBikeStream(InputStream):
-    """Enhanced stream with better importance calculation and station analysis."""
+    """Enhanced stream with multi-threaded CSV processing and better importance calculation."""
     
-    def __init__(self, csv_file: str, max_events: int = 10000):
+    def __init__(self, csv_files: Union[str, List[str]], max_events: int = 10000, num_threads: int = 4):
         super().__init__()
-        self.formatter = CitiBikeCSVFormatter(csv_file)
+        
+        # Handle both single file and multiple files
+        if isinstance(csv_files, str):
+            # Support glob patterns
+            if '*' in csv_files or '?' in csv_files:
+                self.csv_files = glob.glob(csv_files)
+            else:
+                self.csv_files = [csv_files]
+        else:
+            self.csv_files = csv_files
+        
         self.max_events = max_events
+        self.num_threads = min(num_threads, len(self.csv_files))
         self.count = 0
+        self.loading_complete = False
+        
+        # Thread-safe queue for processed events
+        self.processed_queue = Queue()
+        self.loading_lock = threading.Lock()
         
         # Station analysis for better importance calculation
         self.station_popularity = {}
         self.station_zones = {}
-        self._analyze_stations()
         
-        # Load data with enhanced attributes
-        print(f"Loading enhanced CitiBike data from {csv_file}...")
-        for data in self.formatter:
-            if self.count >= max_events:
+        # Load data with multi-threading
+        self._load_data_multithreaded()
+        
+        print(f"Finished loading {self.count} events with enhanced attributes from {len(self.csv_files)} files")
+    
+    def _load_data_multithreaded(self):
+        """Load data from multiple CSV files using multiple threads."""
+        print(f"Loading enhanced CitiBike data from {len(self.csv_files)} files using {self.num_threads} threads...")
+        
+        # First pass: analyze stations across all files
+        self._analyze_stations_multithreaded()
+        
+        # Second pass: load events with enhanced attributes
+        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            # Submit tasks for each CSV file
+            future_to_file = {
+                executor.submit(self._process_csv_file, csv_file, file_idx): csv_file 
+                for file_idx, csv_file in enumerate(self.csv_files)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_file):
+                csv_file = future_to_file[future]
+                try:
+                    file_count = future.result()
+                    print(f"Processed {file_count} events from {os.path.basename(csv_file)}")
+                except Exception as e:
+                    logger.error(f"Error processing {csv_file}: {e}")
+        
+        # Transfer processed events to main stream
+        while not self.processed_queue.empty():
+            try:
+                event_data = self.processed_queue.get_nowait()
+                self._stream.put(event_data)
+                self.count += 1
+            except Empty:
                 break
-            
-            # Enhanced importance calculation
-            data['importance'] = self._calculate_enhanced_importance(data)
-            data['priority'] = self._calculate_enhanced_priority(data)
-            data['time_criticality'] = self._get_time_criticality(data)
-            data['station_importance'] = self._get_station_importance(data)
-            data['event_type'] = "BikeTrip"
-            
-            self._stream.put(data)
-            self.count += 1
-            
-            if self.count % 500 == 0:
-                print(f"Loaded {self.count}/{max_events} events...")
         
         self.close()
-        print(f"Finished loading {self.count} events with enhanced attributes")
     
-    def _analyze_stations(self):
-        """Analyze station popularity and geographic distribution."""
+    def _process_csv_file(self, csv_file: str, file_idx: int) -> int:
+        """Process a single CSV file in a separate thread."""
+        file_count = 0
+        events_per_file = self.max_events // len(self.csv_files) if len(self.csv_files) > 1 else self.max_events
+        
+        try:
+            formatter = CitiBikeCSVFormatter(csv_file)
+            for data in formatter:
+                with self.loading_lock:
+                    if self.count >= self.max_events:
+                        break
+                
+                if file_count >= events_per_file:
+                    break
+                
+                # Enhanced importance calculation
+                data['importance'] = self._calculate_enhanced_importance(data)
+                data['priority'] = self._calculate_enhanced_priority(data)
+                data['time_criticality'] = self._get_time_criticality(data)
+                data['station_importance'] = self._get_station_importance(data)
+                data['event_type'] = "BikeTrip"
+                data['source_file'] = os.path.basename(csv_file)
+                data['file_index'] = file_idx
+                
+                # Add to processed queue
+                self.processed_queue.put(data)
+                file_count += 1
+                
+                if file_count % 500 == 0:
+                    print(f"Thread {file_idx}: Processed {file_count} events from {os.path.basename(csv_file)}")
+                    
+        except Exception as e:
+            logger.error(f"Error in thread processing {csv_file}: {e}")
+        
+        return file_count
+    
+    def _analyze_stations_multithreaded(self):
+        """Analyze station popularity across all files using multiple threads."""
+        print("Analyzing stations across all files...")
+        
+        # Thread-safe collections for station data
         station_counts = {}
         station_locations = {}
+        analysis_lock = threading.Lock()
         
-        # Quick pass to collect station statistics
-        temp_formatter = CitiBikeCSVFormatter(self.formatter.filepath)
-        sample_count = 0
-        
-        for data in temp_formatter:
-            if sample_count >= 5000:  # Sample for analysis
-                break
+        def analyze_file_stations(csv_file: str):
+            """Analyze stations from a single file."""
+            local_counts = {}
+            local_locations = {}
+            
+            try:
+                formatter = CitiBikeCSVFormatter(csv_file)
+                sample_count = 0
                 
-            start_station = data.get("start_station_id")
-            end_station = data.get("end_station_id")
-            
-            if start_station:
-                station_counts[start_station] = station_counts.get(start_station, 0) + 1
-                if start_station not in station_locations:
-                    station_locations[start_station] = {
-                        'name': data.get("start_station_name", ""),
-                        'lat': data.get("start_lat"),
-                        'lng': data.get("start_lng")
-                    }
-            
-            if end_station:
-                station_counts[end_station] = station_counts.get(end_station, 0) + 1
-                if end_station not in station_locations:
-                    station_locations[end_station] = {
-                        'name': data.get("end_station_name", ""),
-                        'lat': data.get("end_lat"),
-                        'lng': data.get("end_lng")
-                    }
-            
-            sample_count += 1
+                for data in formatter:
+                    if sample_count >= 1000:  # Sample per file for analysis
+                        break
+                        
+                    start_station = data.get("start_station_id")
+                    end_station = data.get("end_station_id")
+                    
+                    if start_station:
+                        local_counts[start_station] = local_counts.get(start_station, 0) + 1
+                        if start_station not in local_locations:
+                            local_locations[start_station] = {
+                                'name': data.get("start_station_name", ""),
+                                'lat': data.get("start_lat"),
+                                'lng': data.get("start_lng")
+                            }
+                    
+                    if end_station:
+                        local_counts[end_station] = local_counts.get(end_station, 0) + 1
+                        if end_station not in local_locations:
+                            local_locations[end_station] = {
+                                'name': data.get("end_station_name", ""),
+                                'lat': data.get("end_lat"),
+                                'lng': data.get("end_lng")
+                            }
+                    
+                    sample_count += 1
+                
+                # Merge with global collections
+                with analysis_lock:
+                    for station_id, count in local_counts.items():
+                        station_counts[station_id] = station_counts.get(station_id, 0) + count
+                    
+                    for station_id, location in local_locations.items():
+                        if station_id not in station_locations:
+                            station_locations[station_id] = location
+                            
+            except Exception as e:
+                logger.error(f"Error analyzing stations in {csv_file}: {e}")
+        
+        # Process files in parallel for station analysis
+        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            futures = [executor.submit(analyze_file_stations, csv_file) for csv_file in self.csv_files]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Station analysis error: {e}")
         
         # Calculate popularity scores (normalized)
         max_count = max(station_counts.values()) if station_counts else 1
@@ -124,7 +227,7 @@ class EnhancedCitiBikeStream(InputStream):
             for station, count in station_counts.items()
         }
         
-        # Simple geographic zone classification based on coordinates
+        # Simple geographic zone classification
         for station_id, location in station_locations.items():
             lat = location.get('lat', 0)
             lng = location.get('lng', 0)
@@ -141,6 +244,18 @@ class EnhancedCitiBikeStream(InputStream):
                     zone = 'tourist'
                 
                 self.station_zones[station_id] = zone
+        
+        print(f"Analyzed {len(self.station_popularity)} unique stations across {len(self.csv_files)} files")
+    
+    def get_thread_stats(self) -> Dict:
+        """Get statistics about multi-threaded processing."""
+        return {
+            'total_files': len(self.csv_files),
+            'threads_used': self.num_threads,
+            'events_loaded': self.count,
+            'stations_analyzed': len(self.station_popularity),
+            'files_processed': [os.path.basename(f) for f in self.csv_files]
+        }
     
     def _calculate_enhanced_importance(self, data) -> float:
         """Enhanced importance calculation with multiple factors."""
@@ -345,9 +460,15 @@ def create_enhanced_patterns() -> List[Pattern]:
 class SimpleOutputStream(OutputStream):
     """Enhanced output stream with pattern analysis."""
     
-    def __init__(self, file_path: str = "enhanced_citybike.txt"):
+    def __init__(self, file_path: str = "enhanced_citybike.txt", is_async: bool = False):
         super().__init__()
         self.file_path = file_path
+        self.__is_async = is_async
+        if self.__is_async:
+            self.__output_file = open(self.file_path, 'w')
+        else:
+            self.__output_file = None
+            self.__output_buffer = []
         self.matches = []
         self.pattern_stats = {}
     
@@ -355,6 +476,12 @@ class SimpleOutputStream(OutputStream):
         """Add item with pattern analysis."""
         self.matches.append(item)
         super().add_item(item)
+        
+        if self.__is_async:
+            self.__output_file.write(str(item) + "\n")
+            self.__output_file.flush()  # Ensure immediate write
+        else:
+            self.__output_buffer.append(item)
         
         # Analyze pattern if it's a pattern match
         if hasattr(item, 'pattern_name') or (isinstance(item, dict) and 'pattern' in str(item)):
@@ -380,20 +507,95 @@ class SimpleOutputStream(OutputStream):
         }
         
         return analysis
-
-
-def run_enhanced_demo(csv_file: str, max_events: int = 5000):
-    """Run enhanced CitiBike load shedding demonstration."""
     
-    if not os.path.exists(csv_file):
-        print(f"Error: CSV file not found: {csv_file}")
-        return
+    def get_matches(self):
+        """Get all collected matches."""
+        return self.matches
+    
+    def close(self):
+        """Close the output stream and flush any pending data."""
+        if self.__is_async and self.__output_file:
+            self.__output_file.close()
+            self.__output_file = None
+        elif not self.__is_async and self.__output_buffer:
+            # Write buffered items to file if needed
+            if self.file_path:
+                with open(self.file_path, 'w') as f:
+                    for item in self.__output_buffer:
+                        f.write(str(item) + "\n")
+                self.__output_buffer.clear()
+    
+    def __del__(self):
+        """Destructor to ensure file is closed."""
+        if hasattr(self, '_SimpleOutputStream__is_async') and self.__is_async:
+            if hasattr(self, '_SimpleOutputStream__output_file') and self.__output_file:
+                try:
+                    self.__output_file.close()
+                except:
+                    pass
+    
+class CitiBikeEventTypeClassifier:
+    def get_event_type(self, event_payload):
+        return "BikeTrip"
+
+class SimpleCitiBikeDataFormatter:
+    def __init__(self):
+        self.classifier = CitiBikeEventTypeClassifier()
+    
+    def get_event_type(self, event_payload):
+        return self.classifier.get_event_type(event_payload)
+    
+    def get_probability(self, event_payload):
+        # Return None for non-probabilistic events
+        return None
+    
+    def parse_event(self, raw_data):
+        return raw_data if isinstance(raw_data, dict) else {"data": str(raw_data)}
+    
+    def get_event_timestamp(self, event_payload):
+        if "ts" in event_payload:
+            ts = event_payload["ts"]
+            return ts.timestamp() if hasattr(ts, 'timestamp') else float(ts)
+        return datetime.now().timestamp()
+    
+    def format(self, data):
+        return str(data)
+
+def run_enhanced_demo(csv_files: Union[str, List[str]], max_events: int = 5000, force_async: bool = False, num_threads: int = 4):
+    """Run enhanced CitiBike load shedding demonstration with multi-file support."""
+    
+    # Handle file validation
+    if isinstance(csv_files, str):
+        if '*' in csv_files or '?' in csv_files:
+            resolved_files = glob.glob(csv_files)
+            if not resolved_files:
+                print(f"Error: No files found matching pattern: {csv_files}")
+                return
+            csv_files = resolved_files
+        else:
+            if not os.path.exists(csv_files):
+                print(f"Error: CSV file not found: {csv_files}")
+                print(f"Current directory: {os.getcwd()}")
+                print(f"Files in current directory: {[f for f in os.listdir('.') if f.endswith('.csv')]}")
+                return
+            csv_files = [csv_files]
+    else:
+        missing_files = [f for f in csv_files if not os.path.exists(f)]
+        if missing_files:
+            print(f"Error: Files not found: {missing_files}")
+            return
     
     print("=" * 70)
-    print("ENHANCED CITIBIKE HOT PATH DETECTION & LOAD SHEDDING DEMO")
+    print("ENHANCED CITIBIKE MULTI-THREADED HOT PATH DETECTION & LOAD SHEDDING DEMO")
     print("=" * 70)
-    print(f"Data file: {csv_file}")
+    print(f"Data files: {len(csv_files)} files")
+    for i, f in enumerate(csv_files[:5]):  # Show first 5 files
+        print(f"  {i+1}. {os.path.basename(f)}")
+    if len(csv_files) > 5:
+        print(f"  ... and {len(csv_files) - 5} more files")
     print(f"Max events: {max_events}")
+    print(f"Threads: {num_threads}")
+    print(f"Async mode: {force_async or max_events > 1000}")
     print(f"Enhanced strategies available: {ENHANCED_STRATEGIES_AVAILABLE}")
     
     # Create enhanced patterns
@@ -445,36 +647,16 @@ def run_enhanced_demo(csv_file: str, max_events: int = 5000):
             cep = CEP(patterns)
         
         # Create streams
-        input_stream = EnhancedCitiBikeStream(csv_file, max_events)
-        output_stream = SimpleOutputStream(f"enhanced_{config_name.replace(' ', '_').lower()}.txt")
+        input_stream = EnhancedCitiBikeStream(csv_files, max_events, num_threads)
+        # Enable async mode for better performance with large datasets or when explicitly requested
+        is_async = force_async or max_events > 1000
+        output_stream = SimpleOutputStream(f"enhanced_{config_name.replace(' ', '_').lower()}.txt", is_async=is_async)
+        
+        # Display thread statistics
+        thread_stats = input_stream.get_thread_stats()
+        print(f"  Thread stats: {thread_stats['threads_used']} threads, {thread_stats['total_files']} files, {thread_stats['stations_analyzed']} stations")
         
         # Simple data formatter
-        class SimpleCitiBikeDataFormatter:
-            def __init__(self):
-                self.classifier = CitiBikeEventTypeClassifier()
-            
-            def get_event_type(self, event_payload):
-                return self.classifier.get_event_type(event_payload)
-            
-            def get_probability(self, event_payload):
-                # Return None for non-probabilistic events
-                return None
-            
-            def parse_event(self, raw_data):
-                return raw_data if isinstance(raw_data, dict) else {"data": str(raw_data)}
-            
-            def get_event_timestamp(self, event_payload):
-                if "ts" in event_payload:
-                    ts = event_payload["ts"]
-                    return ts.timestamp() if hasattr(ts, 'timestamp') else float(ts)
-                return datetime.now().timestamp()
-            
-            def format(self, data):
-                return str(data)
-        
-        class CitiBikeEventTypeClassifier:
-            def get_event_type(self, event_payload):
-                return "BikeTrip"
         
         data_formatter = SimpleCitiBikeDataFormatter()
         
@@ -484,6 +666,9 @@ def run_enhanced_demo(csv_file: str, max_events: int = 5000):
         
         duration = cep.run(input_stream, output_stream, data_formatter)
         end_time = time.time()
+        
+        # Close output stream to ensure all data is written
+        output_stream.close()
         
         # Get results
         analysis = output_stream.get_analysis()
@@ -565,24 +750,28 @@ def main():
     """Main function."""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Enhanced CitiBike Load Shedding Demo')
-    parser.add_argument('--csv', default='201306-citibike-tripdata.csv',
-                       help='Path to CitiBike CSV file')
+    parser = argparse.ArgumentParser(description='Enhanced Multi-threaded CitiBike Load Shedding Demo')
+    parser.add_argument('--csv', default='test_data/201306-citibike-tripdata.csv',
+                       help='Path to CitiBike CSV file(s). Supports glob patterns like "test_data/*.csv" or multiple files')
+    parser.add_argument('--files', nargs='+',
+                       help='Multiple CSV files to process')
     parser.add_argument('--events', type=int, default=2000,
                        help='Maximum number of events to process')
+    parser.add_argument('--threads', type=int, default=4,
+                       help='Number of threads for parallel processing')
+    parser.add_argument('--async', action='store_true',
+                       help='Enable async output mode for better performance')
     
     args = parser.parse_args()
     
-    if not os.path.exists(args.csv):
-        print(f"Error: CitiBike CSV file not found: {args.csv}")
-        print("Please ensure the file exists and the path is correct.")
-        return
+    # Determine which files to process
+    csv_files = args.files if args.files else args.csv
     
-    print("Enhanced CitiBike Hot Path Detection & Load Shedding Demo")
+    print("Enhanced Multi-threaded CitiBike Hot Path Detection & Load Shedding Demo")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    results = run_enhanced_demo(args.csv, args.events)
-    print("\nEnhanced demo completed successfully!")
+    results = run_enhanced_demo(csv_files, args.events, getattr(args, 'async'), args.threads)
+    print("\nEnhanced multi-threaded demo completed successfully!")
     
     # Generate recommendations
     print(f"\n{'=' * 70}")

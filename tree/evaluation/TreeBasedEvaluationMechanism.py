@@ -60,8 +60,8 @@ class TreeBasedEvaluationMechanism(EvaluationMechanism, ABC):
         self._event_types_listeners = self._register_event_listeners(self._tree)
         last_statistics_refresh_time = None
 
-        print("Starting to iterate over events...")
-        print(f"Event stream type: {events}")
+        # print("Starting to iterate over events...")
+        # print(f"Event stream type: {events}")
         event_count = 0
         for raw_event in events:
             event_count += 1
@@ -131,7 +131,7 @@ class TreeBasedEvaluationMechanism(EvaluationMechanism, ABC):
         Collects the ready matches from the tree and adds them to the evaluation matches.
         """
         for match in self._tree.get_matches():
-            print(f"Match found: {match}")
+            # print(f"Match found: {match}")
             matches.add_item(match)
             self._remove_matched_freezers(match.events)
 
