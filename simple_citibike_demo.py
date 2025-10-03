@@ -164,8 +164,38 @@ class SimpleCitiBikeDataFormatter(DataFormatter):
         
         # Fallback
         return {"data": str(raw_data)}
-    
+
     def get_event_timestamp(self, event_payload: dict):
+        """Return a datetime (not float) so the engine can do datetime - timedelta."""
+        ts = event_payload.get("ts")
+
+        # Ya es datetime → úsalo tal cual
+        if isinstance(ts, datetime):
+            return ts
+
+        # Cadena ISO → parsear (e.g., '2025-10-03T12:34:56' o '2025-10-03 12:34:56')
+        if isinstance(ts, str):
+            # intenta ISO primero
+            try:
+                return datetime.fromisoformat(ts.replace('Z', '+00:00'))  # tolera 'Z'
+            except Exception:
+                # fallback común: 'YYYY-MM-DD HH:MM:SS'
+                try:
+                    return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass  # seguiremos a siguiente opción
+
+        # Epoch (int/float) → convertir a datetime
+        if isinstance(ts, (int, float)):
+            try:
+                return datetime.fromtimestamp(ts)
+            except Exception:
+                pass
+
+        # Fallback seguro: ahora
+        return datetime.now()
+
+    #def get_event_timestamp(self, event_payload: dict):
         """Extract timestamp from event payload."""
         logger.debug(f"Getting timestamp from payload keys: {list(event_payload.keys())}")
         if "ts" in event_payload:
@@ -182,43 +212,122 @@ class SimpleCitiBikeDataFormatter(DataFormatter):
     def format(self, data):
         return str(data)
 
+class AdjacentChainingKC(KCCondition):
+    def __init__(self, kleene_var="a",
+                 bike_key="bikeid",
+                 start_key="start_station_id",
+                 end_key="end_station_id"):
+
+        def _payload(ev):
+            if isinstance(ev, dict):
+                return ev
+            p = getattr(ev, "payload", None)
+            if p is not None:
+                return p
+            gp = getattr(ev, "get_payload", None)
+            return gp() if callable(gp) else ev
+
+        def _to_int(v):
+            try:
+                return int(v)
+            except Exception:
+                return v  # si no es convertible, lo dejamos tal cual
+
+        def getattr_func(ev):
+            p = _payload(ev)
+            # tuple: (bike, start, end) con cast a int si es posible
+            return (_to_int(p.get(bike_key)),
+                    _to_int(p.get(start_key)),
+                    _to_int(p.get(end_key)))
+
+        def relation_op(prev_tuple, curr_tuple):
+            # misma bici + encadenamiento
+            return (prev_tuple[0] == curr_tuple[0]) and (prev_tuple[2] == curr_tuple[1])
+
+        super().__init__(kleene_var, getattr_func, relation_op)
+
+        self._kleene_var = kleene_var
+        self._bike_key = bike_key
+        self._start_key = start_key
+        self._end_key = end_key
+
+    def _to_payload(self, e):
+        if isinstance(e, dict):
+            return e
+        p = getattr(e, "payload", None)
+        if p is not None:
+            return p
+        gp = getattr(e, "get_payload", None)
+        return gp() if callable(gp) else e
+
+    def _extract_seq(self, ctx):
+        if isinstance(ctx, list):
+            return ctx
+        if isinstance(ctx, dict):
+            return ctx.get(self._kleene_var) or ctx.get("a") or []
+        return []
+
+    def _eval(self, ctx) -> bool:
+        seq = self._extract_seq(ctx)
+        if len(seq) <= 1:
+            return True
+        for prev, curr in zip(seq, seq[1:]):
+            p = self._to_payload(prev)
+            c = self._to_payload(curr)
+
+            if str(p.get(self._bike_key)) != str(c.get(self._bike_key)):
+                return False
+            if str(p.get(self._end_key)) != str(c.get(self._start_key)):
+                return False
+        return True
+
 
 def create_sample_patterns():
-    """Create sample patterns for CitiBike analysis."""
     logger.info("Creating sample patterns...")
     patterns = []
-    
-    # Pattern 1: Rush hour commute pattern
-    # Pattern 1: Rush hour commute pattern
+
+    # SEQ( BikeTrip+ a[], BikeTrip b )
+    pattern1_structure = SeqOperator(
+        KleeneClosureOperator(PrimitiveEventStructure("BikeTrip", "a")),  # a[] with Kleene +
+        PrimitiveEventStructure("BikeTrip", "b")                          # b
+    )
+
+    # chain a[]
+    chain_inside_a = AdjacentChainingKC(
+        kleene_var="a",
+        bike_key="bikeid",
+        start_key="start_station_id",
+        end_key="end_station_id"
+    )
+
+    # same bike between a[last] y b
+    same_bike_last_a_b = EqCondition(
+        Variable("a", lambda x: x["bikeid"]),
+        Variable("b", lambda x: x["bikeid"])
+    )
+
+    #b finish in {7,8,9}
+    b_ends_in_target = AndCondition(
+        GreaterThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 6),
+        SmallerThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 10)
+    )
+
+    pattern1_condition = AndCondition(
+        chain_inside_a,
+        same_bike_last_a_b,
+        b_ends_in_target
+    )
+
     pattern1 = Pattern(
-        SeqOperator(
-            PrimitiveEventStructure("BikeTrip", "a"),
-            PrimitiveEventStructure("BikeTrip", "b")
-        ),
-        AndCondition(
-            EqCondition(Variable("a", lambda x: x["bikeid"]), Variable("b", lambda x: x["bikeid"])),
-            SmallerThanCondition(Variable("b", lambda x: x["ts"].hour), 18),
-            GreaterThanCondition(Variable("b", lambda x: x["ts"].hour), 0),
-            EqCondition(Variable("a", lambda x: x["end_station_id"]), Variable("b", lambda x: x["start_station_id"]))
-        ),
-        3600  # 1 hour in seconds instead of timedelta(hours=1)
+        pattern1_structure,
+        pattern1_condition,
+        timedelta(hours=1)
     )
     pattern1.name = "HotPathDetection"
     patterns.append(pattern1)
-    logger.info(f"Created {len(patterns)} patterns")
-    
-    # # Pattern 2: Weekend leisure pattern
-    # pattern2 = Pattern()
-    # pattern2.name = "WeekendLeisure" 
-    # patterns.append(pattern2)
-    
-    # # Pattern 3: Long distance trip pattern
-    # pattern3 = Pattern()
-    # pattern3.name = "LongDistanceTrip"
-    # patterns.append(pattern3)
-    
-    return patterns
 
+    logger.info(f"Created {len(patterns)} patterns")
+    return patterns
 
 def run_basic_citibike_test(csv_file: str, max_events: int = 5000):
     """Run basic CitiBike load shedding test."""
@@ -371,7 +480,7 @@ def main():
     parser = argparse.ArgumentParser(description='CitiBike Load Shedding Demo')
     parser.add_argument('--csv', default='201309-citibike-tripdata.csv',
                        help='Path to CitiBike CSV file')
-    parser.add_argument('--events', type=int, default=10,
+    parser.add_argument('--events', type=int, default=1000,
                        help='Maximum number of events to process')
     
     args = parser.parse_args()
