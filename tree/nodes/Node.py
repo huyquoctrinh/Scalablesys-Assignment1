@@ -58,7 +58,7 @@ class Node(ABC):
     ###################################### Initialization
     def __init__(self, pattern_params: PatternParameters, parents, pattern_ids: int or Set[int] = None):
         self._parents = []
-        self._sliding_window = pattern_params.window
+        self._sliding_window = pattern_params.window.seconds
         self._confidence = pattern_params.confidence
         self._partial_matches = None
         self._condition = AndCondition()
@@ -110,6 +110,7 @@ class Node(ABC):
         """
         if not Node._is_partial_match_expiration_enabled():
             return
+        # print(last_timestamp, self._sliding_window.seconds)
         self._partial_matches.try_clean_expired_partial_matches(last_timestamp - self._sliding_window)
         if len(self._single_event_types) == 0:
             # "single" consumption policy is disabled or no event types under the policy reach this node

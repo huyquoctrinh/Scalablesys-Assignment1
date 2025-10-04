@@ -15,7 +15,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue, Empty
 import glob
-
+# from condition.KleeneClosureCondition import KleeneClosureOperator, AdjacentChainingKC
+from base.PatternStructure import SeqOperator, PrimitiveEventStructure, KleeneClosureOperator
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ from condition.Condition import Variable
 from condition.CompositeCondition import AndCondition
 from base.PatternStructure import SeqOperator, PrimitiveEventStructure
 from loadshedding import LoadSheddingConfig, PresetConfigs
+from condition.KCCondition import KCCondition
 
 try:
     from loadshedding.EnhancedLoadSheddingStrategy import (
@@ -48,6 +50,74 @@ except ImportError:
 
 LOAD_SHEDDING_AVAILABLE = True
 
+class AdjacentChainingKC(KCCondition):
+    def __init__(self, kleene_var="a",
+                 bike_key="bikeid",
+                 start_key="start_station_id",
+                 end_key="end_station_id"):
+
+        def _payload(ev):
+            if isinstance(ev, dict):
+                return ev
+            p = getattr(ev, "payload", None)
+            if p is not None:
+                return p
+            gp = getattr(ev, "get_payload", None)
+            return gp() if callable(gp) else ev
+
+        def _to_int(v):
+            try:
+                return int(v)
+            except Exception:
+                return v  # si no es convertible, lo dejamos tal cual
+
+        def getattr_func(ev):
+            p = _payload(ev)
+            # tuple: (bike, start, end) con cast a int si es posible
+            return (_to_int(p.get(bike_key)),
+                    _to_int(p.get(start_key)),
+                    _to_int(p.get(end_key)))
+
+        def relation_op(prev_tuple, curr_tuple):
+            # misma bici + encadenamiento
+            return (prev_tuple[0] == curr_tuple[0]) and (prev_tuple[2] == curr_tuple[1])
+
+        super().__init__(kleene_var, getattr_func, relation_op)
+
+        self._kleene_var = kleene_var
+        self._bike_key = bike_key
+        self._start_key = start_key
+        self._end_key = end_key
+
+    def _to_payload(self, e):
+        if isinstance(e, dict):
+            return e
+        p = getattr(e, "payload", None)
+        if p is not None:
+            return p
+        gp = getattr(e, "get_payload", None)
+        return gp() if callable(gp) else e
+
+    def _extract_seq(self, ctx):
+        if isinstance(ctx, list):
+            return ctx
+        if isinstance(ctx, dict):
+            return ctx.get(self._kleene_var) or ctx.get("a") or []
+        return []
+
+    def _eval(self, ctx) -> bool:
+        seq = self._extract_seq(ctx)
+        if len(seq) <= 1:
+            return True
+        for prev, curr in zip(seq, seq[1:]):
+            p = self._to_payload(prev)
+            c = self._to_payload(curr)
+
+            if str(p.get(self._bike_key)) != str(c.get(self._bike_key)):
+                return False
+            if str(p.get(self._end_key)) != str(c.get(self._start_key)):
+                return False
+        return True
 
 class EnhancedCitiBikeStream(InputStream):
     """Enhanced stream with multi-threaded CSV processing and better importance calculation."""
@@ -364,96 +434,51 @@ class EnhancedCitiBikeStream(InputStream):
         return self.station_popularity.get(start_station, 0.5)
 
 
-def create_enhanced_patterns() -> List[Pattern]:
-    """Create enhanced patterns for better hot path detection."""
+def create_enhanced_patterns():
+    logger.info("Creating sample patterns...")
     patterns = []
-    
-    # Pattern 1: Enhanced Morning Rush Hour Hot Paths
-    morning_pattern = Pattern(
-        SeqOperator(
-            PrimitiveEventStructure("BikeTrip", "morning_out"),
-            PrimitiveEventStructure("BikeTrip", "morning_return")
-        ),
-        AndCondition(
-            EqCondition(Variable("morning_out", lambda x: x["bikeid"]), 
-                       Variable("morning_return", lambda x: x["bikeid"])),
-            EqCondition(Variable("morning_out", lambda x: x["end_station_id"]), 
-                       Variable("morning_return", lambda x: x["start_station_id"])),
-            GreaterThanCondition(Variable("morning_out", lambda x: x["ts"].hour), 6),
-            SmallerThanCondition(Variable("morning_out", lambda x: x["ts"].hour), 11),
-            SmallerThanCondition(Variable("morning_out", lambda x: x["ts"].weekday()), 5),  # Weekdays only
-            # Add minimum trip duration to filter out very short trips
-            GreaterThanCondition(Variable("morning_out", lambda x: x.get("tripduration_s", 0)), 300)
-        ),
-        7200  # 2 hours window for morning commute patterns
+
+    # SEQ( BikeTrip+ a[], BikeTrip b )
+    pattern1_structure = SeqOperator(
+        KleeneClosureOperator(PrimitiveEventStructure("BikeTrip", "a")),  # a[] with Kleene +
+        PrimitiveEventStructure("BikeTrip", "b")                          # b
     )
-    morning_pattern.name = "MorningRushHotPath"
-    morning_pattern.priority = 9.0
-    patterns.append(morning_pattern)
-    
-    # Pattern 2: Enhanced Evening Rush Hour Hot Paths
-    evening_pattern = Pattern(
-        SeqOperator(
-            PrimitiveEventStructure("BikeTrip", "evening_out"),
-            PrimitiveEventStructure("BikeTrip", "evening_return")
-        ),
-        AndCondition(
-            EqCondition(Variable("evening_out", lambda x: x["bikeid"]), 
-                       Variable("evening_return", lambda x: x["bikeid"])),
-            EqCondition(Variable("evening_out", lambda x: x["end_station_id"]), 
-                       Variable("evening_return", lambda x: x["start_station_id"])),
-            GreaterThanCondition(Variable("evening_out", lambda x: x["ts"].hour), 16),
-            SmallerThanCondition(Variable("evening_out", lambda x: x["ts"].hour), 21),
-            SmallerThanCondition(Variable("evening_out", lambda x: x["ts"].weekday()), 5),
-            GreaterThanCondition(Variable("evening_out", lambda x: x.get("tripduration_s", 0)), 300)
-        ),
-        7200  # 2 hours window
+
+    # chain a[]
+    chain_inside_a = AdjacentChainingKC(
+        kleene_var="a",
+        bike_key="bikeid",
+        start_key="start_station_id",
+        end_key="end_station_id"
     )
-    evening_pattern.name = "EveningRushHotPath"
-    evening_pattern.priority = 9.0
-    patterns.append(evening_pattern)
-    
-    # Pattern 3: Weekend Leisure Hot Paths
-    weekend_pattern = Pattern(
-        SeqOperator(
-            PrimitiveEventStructure("BikeTrip", "leisure_out"),
-            PrimitiveEventStructure("BikeTrip", "leisure_return")
-        ),
-        AndCondition(
-            EqCondition(Variable("leisure_out", lambda x: x["bikeid"]), 
-                       Variable("leisure_return", lambda x: x["bikeid"])),
-            EqCondition(Variable("leisure_out", lambda x: x["end_station_id"]), 
-                       Variable("leisure_return", lambda x: x["start_station_id"])),
-            GreaterThanCondition(Variable("leisure_out", lambda x: x["ts"].weekday()), 4),  # Weekends
-            GreaterThanCondition(Variable("leisure_out", lambda x: x.get("tripduration_s", 0)), 600)  # Longer trips
-        ),
-        14400  # 4 hours window for leisure activities
+
+    # same bike between a[last] y b
+    same_bike_last_a_b = EqCondition(
+        Variable("a", lambda x: x["bikeid"]),
+        Variable("b", lambda x: x["bikeid"])
     )
-    weekend_pattern.name = "WeekendLeisureHotPath"
-    weekend_pattern.priority = 6.0
-    patterns.append(weekend_pattern)
-    
-    # Pattern 4: High-Value Station Hot Paths (for popular stations)
-    popular_station_pattern = Pattern(
-        SeqOperator(
-            PrimitiveEventStructure("BikeTrip", "pop_out"),
-            PrimitiveEventStructure("BikeTrip", "pop_return")
-        ),
-        AndCondition(
-            EqCondition(Variable("pop_out", lambda x: x["bikeid"]), 
-                       Variable("pop_return", lambda x: x["bikeid"])),
-            EqCondition(Variable("pop_out", lambda x: x["end_station_id"]), 
-                       Variable("pop_return", lambda x: x["start_station_id"])),
-            # Focus on trips involving popular stations
-            GreaterThanCondition(Variable("pop_out", lambda x: x.get("station_importance", 0)), 0.7),
-            GreaterThanCondition(Variable("pop_out", lambda x: x.get("tripduration_s", 0)), 300)
-        ),
-        5400  # 1.5 hours window
+
+    #b finish in {7,8,9}
+    b_ends_in_target = AndCondition(
+        GreaterThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 6),
+        SmallerThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 10)
     )
-    popular_station_pattern.name = "PopularStationHotPath"
-    popular_station_pattern.priority = 7.5
-    patterns.append(popular_station_pattern)
-    
+
+    pattern1_condition = AndCondition(
+        chain_inside_a,
+        same_bike_last_a_b,
+        b_ends_in_target
+    )
+
+    pattern1 = Pattern(
+        pattern1_structure,
+        pattern1_condition,
+        timedelta(hours=1)  # 1 hour timeout
+    )
+    pattern1.name = "HotPathDetection"
+    patterns.append(pattern1)
+
+    logger.info(f"Created {len(patterns)} patterns")
     return patterns
 
 
