@@ -37,7 +37,7 @@ import time
 import os
 from datetime import datetime, timedelta
 from base.PatternStructure import SeqOperator, PrimitiveEventStructure, KleeneClosureOperator
-from loadshedding import LoadSheddingConfig, PresetConfigs
+from loadshedding.config import LoadSheddingConfig
 LOAD_SHEDDING_AVAILABLE = True
 
 
@@ -330,145 +330,65 @@ def create_sample_patterns():
     return patterns
 
 def run_basic_citibike_test(csv_file: str, max_events: int = 5000):
-    """Run basic CitiBike load shedding test."""
+    """Run test with load shedding wrapper"""
     
-    if not os.path.exists(csv_file):
-        print(f"Error: CSV file not found: {csv_file}")
-        return
-    
-    print("=" * 60)
-    print("CITIBIKE LOAD SHEDDING DEMONSTRATION")
-    print("=" * 60)
-    print(f"Data file: {csv_file}")
-    print(f"Max events: {max_events}")
-    print(f"Load shedding available: {LOAD_SHEDDING_AVAILABLE}")
-    
-    # Create patterns
-    patterns = create_sample_patterns()
-    
-    # Test configurations
-    configs = {}
-    
-    if LOAD_SHEDDING_AVAILABLE:
-        configs = {
-            'No Load Shedding': LoadSheddingConfig(enabled=False),
-            'Conservative': PresetConfigs.conservative(),
-            'Semantic (CitiBike-tuned)': LoadSheddingConfig(
-                strategy_name='semantic',
-                pattern_priorities={
-                    'RushHourCommute': 9.0,
-                    'WeekendLeisure': 5.0,
-                    'LongDistanceTrip': 7.0
-                },
-                importance_attributes=['importance', 'priority'],
-                memory_threshold=0.7,
-                cpu_threshold=0.8
-            )
-        }
-    else:
-        configs = {'No Load Shedding': None}
+    configs = {
+        'No Load Shedding': None,
+        'Conservative': LoadSheddingConfig(
+            enabled=True,
+            memory_threshold=0.85,
+            shedding_rate=0.15,
+            target_latency_ratio=0.9
+        ),
+        'Balanced': LoadSheddingConfig(
+            enabled=True,
+            memory_threshold=0.70,
+            shedding_rate=0.30,
+            target_latency_ratio=0.5
+        ),
+        'Aggressive': LoadSheddingConfig(
+            enabled=True,
+            memory_threshold=0.50,
+            shedding_rate=0.50,
+            target_latency_ratio=0.3
+        )
+    }
     
     results = {}
     
     for config_name, config in configs.items():
         print(f"\nTesting: {config_name}")
-        print("-" * 40)
         
-        logger.info(f"Creating CEP instance for {config_name}")
-        # Create CEP instance
-        if LOAD_SHEDDING_AVAILABLE and config:
-            logger.info(f"Using load shedding config: {config}")
-            cep = CEP(patterns, load_shedding_config=config)
-        else:
-            logger.info("Creating CEP without load shedding")
-            cep = CEP(patterns)
+        patterns = create_sample_patterns()
         
-        logger.info("Creating streams and data formatter")
-        # Create streams
+        # Create CEP with load shedding (uses wrapper automatically)
+        cep = CEP(patterns, load_shedding_config=config)
+        
         input_stream = SimpleCitiBikeStream(csv_file, max_events)
-        output_stream = SimpleOutputStream(f"output_citybike_{config_name.replace(' ', '_').lower()}.txt")
+        output_stream = SimpleOutputStream(f"output_{config_name}.txt")
         data_formatter = SimpleCitiBikeDataFormatter()
         
-        # Run processing
-        print("  Processing events...")
-        logger.info("Starting CEP processing...")
         start_time = time.time()
-        
-        logger.info("Calling cep.run()...")
         duration = cep.run(input_stream, output_stream, data_formatter)
-        end_time = time.time()
-        logger.info(f"CEP processing completed in {duration:.2f} seconds")
         
-        print(f"  ✓ Completed in {duration:.2f} seconds")
-        print(f"  ✓ Wall clock time: {end_time - start_time:.2f} seconds")
-        print(f"  ✓ Events processed: {input_stream.count}")
-        print(f"  ✓ Matches found: {len(output_stream.get_matches())}")
+        # Get statistics
+        stats = cep.get_load_shedding_statistics()
         
-        # Get load shedding statistics
-        if cep.is_load_shedding_enabled():
-            stats = cep.get_load_shedding_statistics()
-            if stats:
-                print(f"  ✓ Load shedding strategy: {stats['strategy']}")
-                print(f"  ✓ Events dropped: {stats['events_dropped']}")
-                print(f"  ✓ Drop rate: {stats['drop_rate']:.1%}")
-                print(f"  ✓ Current load level: {stats.get('current_load_level', 'unknown')}")
-                print(f"  ✓ Average throughput: {stats.get('avg_throughput_eps', 0):.2f} EPS")
-                
-                results[config_name] = {
-                    'success': True,
-                    'duration': duration,
-                    'wall_clock': end_time - start_time,
-                    'events_processed': input_stream.count,
-                    'matches_found': len(output_stream.get_matches()),
-                    'load_shedding': stats
-                }
-            else:
-                print("  ! Load shedding statistics not available")
-        else:
-            print("  ✓ Load shedding: Disabled")
-            results[config_name] = {
-                'success': True,
-                'duration': duration,
-                'wall_clock': end_time - start_time,
-                'events_processed': input_stream.count,
-                'matches_found': len(output_stream.get_matches()),
-                'load_shedding': None
-            }
-    
-    # Print summary
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    
-    for config_name, result in results.items():
-        print(f"\n{config_name}:")
-        if result['success']:
-            print(f"  Duration: {result['duration']:.2f}s")
-            print(f"  Events: {result['events_processed']}")
-            print(f"  Matches: {result['matches_found']}")
-            
-            if result['load_shedding']:
-                print(f"  Drop Rate: {result['load_shedding']['drop_rate']:.1%}")
-                print(f"  Strategy: {result['load_shedding']['strategy']}")
-        else:
-            print(f"  Error: {result['error']}")
-    
-    # Performance comparison
-    if len([r for r in results.values() if r['success']]) > 1:
-        print(f"\nPERFORMANCE COMPARISON:")
-        print("-" * 25)
+        print(f"  Duration: {duration:.2f}s")
+        print(f"  Matches: {len(output_stream.get_matches())}")
+        if stats:
+            print(f"  Drop Rate: {stats['drop_rate']:.1%}")
+            print(f"  Throughput: {stats.get('avg_throughput_eps', 0):.2f} eps")
         
-        successful_results = [(name, result) for name, result in results.items() if result['success']]
-        baseline = successful_results[0][1]  # Use first successful as baseline
+        results[config_name] = {
+            'duration': duration,
+            'matches': len(output_stream.get_matches()),
+            'load_shedding': stats
+        }
         
-        for name, result in successful_results[1:]:
-            if result['load_shedding']:
-                drop_rate = result['load_shedding']['drop_rate']
-                time_ratio = result['duration'] / baseline['duration']
-                print(f"  {name}:")
-                print(f"    Time vs baseline: {time_ratio:.2f}x")
-                print(f"    Events dropped: {drop_rate:.1%}")
-                print(f"    Matches preserved: {result['matches_found']}/{baseline['matches_found']}")
+        # Reset for next test
+        if config:
+            cep.reset_load_shedding()
     
     return results
 
