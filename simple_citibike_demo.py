@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from city_bike_formatter import CitiBikeCSVFormatter
-from CEP import CEP
+from loadshedding.wrapper import LoadSheddingCEP as CEP
 from stream.Stream import InputStream, OutputStream
 from base.DataFormatter import DataFormatter, EventTypeClassifier
 from base.Event import Event
@@ -286,10 +286,25 @@ def create_sample_patterns():
     logger.info("Creating sample patterns...")
     patterns = []
 
+    # Helper function to safely convert station IDs
+    def safe_station_id(x):
+        """Safely convert station ID to integer"""
+        try:
+            return int(float(x["end_station_id"]))
+        except (ValueError, TypeError, KeyError):
+            return 0
+    
+    def safe_start_station_id(x):
+        """Safely convert start station ID to integer"""
+        try:
+            return int(float(x["start_station_id"]))
+        except (ValueError, TypeError, KeyError):
+            return 0
+
     # SEQ( BikeTrip+ a[], BikeTrip b )
     pattern1_structure = SeqOperator(
-        KleeneClosureOperator(PrimitiveEventStructure("BikeTrip", "a")),  # a[] with Kleene +
-        PrimitiveEventStructure("BikeTrip", "b")                          # b
+        KleeneClosureOperator(PrimitiveEventStructure("BikeTrip", "a")),
+        PrimitiveEventStructure("BikeTrip", "b")
     )
 
     # chain a[]
@@ -300,16 +315,16 @@ def create_sample_patterns():
         end_key="end_station_id"
     )
 
-    # same bike between a[last] y b
+    # same bike between a[last] and b
     same_bike_last_a_b = EqCondition(
         Variable("a", lambda x: x["bikeid"]),
         Variable("b", lambda x: x["bikeid"])
     )
 
-    #b finish in {7,8,9}
+    # b finish in {7,8,9}
     b_ends_in_target = AndCondition(
-        GreaterThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 6),
-        SmallerThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 10)
+        GreaterThanCondition(Variable("b", safe_station_id), 6),
+        SmallerThanCondition(Variable("b", safe_station_id), 10)
     )
 
     pattern1_condition = AndCondition(
