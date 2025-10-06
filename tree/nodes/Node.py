@@ -58,7 +58,7 @@ class Node(ABC):
     ###################################### Initialization
     def __init__(self, pattern_params: PatternParameters, parents, pattern_ids: int or Set[int] = None):
         self._parents = []
-        self._sliding_window = pattern_params.window
+        self._sliding_window = pattern_params.window.seconds
         self._confidence = pattern_params.confidence
         self._partial_matches = None
         self._condition = AndCondition()
@@ -123,6 +123,7 @@ class Node(ABC):
         In case of SortedPatternMatchStorage the insertion is by timestamp or condition, O(log n).
         In case of UnsortedPatternMatchStorage the insertion is directly at the end, O(1).
         """
+        # print(f"Adding partial match: {pm}")
         self._partial_matches.add(pm)
         for parent in self._parents:
             self._parent_to_unhandled_queue_dict[parent].put(pm)

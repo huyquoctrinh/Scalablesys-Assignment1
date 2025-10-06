@@ -120,7 +120,7 @@ class CEP:
         print(f"Events type: {type(events)}")
         print(f"Matches type: {type(matches)}")
         print(f"Data formatter type: {type(data_formatter)}")
-        
+        # print("Number of events:", len(list(next(events))))
         self.__evaluation_manager.eval(events, matches, data_formatter)
         print("Evaluation completed!")
         # finally:

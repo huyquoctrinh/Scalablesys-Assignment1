@@ -1,1 +1,0 @@
-python simple_citibike_demo.py --csv 201306-citibike-tripdata.csv --events 10000

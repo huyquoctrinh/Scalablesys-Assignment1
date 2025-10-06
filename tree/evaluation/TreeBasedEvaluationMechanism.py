@@ -57,12 +57,14 @@ class TreeBasedEvaluationMechanism(EvaluationMechanism, ABC):
         Activates the tree evaluation mechanism on the input event stream and reports all found pattern matches to the
         given output stream.
         """
+        
         self._event_types_listeners = self._register_event_listeners(self._tree)
         last_statistics_refresh_time = None
 
         # print("Starting to iterate over events...")
         # print(f"Event stream type: {events}")
         event_count = 0
+        # print("Number of event types listened to:", len(self._event_types_listeners))
         for raw_event in events:
             event_count += 1
             # print(f"Processing raw event #{event_count}: {raw_event}")
@@ -70,14 +72,16 @@ class TreeBasedEvaluationMechanism(EvaluationMechanism, ABC):
             if event.type not in self._event_types_listeners:
                 continue
             self.__remove_expired_freezers(event)
-
+            print(f"Starting tree-based evaluation mechanism events {event_count}")
             if not self.__is_multi_pattern_mode and self.__statistics_collector is not None:
                 # TODO: support multi-pattern mode
                 last_statistics_refresh_time = self.__perform_reoptimization(last_statistics_refresh_time, event)
-
+            # print(f"Before play new events: {event_count}")
             self._play_new_event_on_tree(event, matches)
+            print(f"After play new events: {event_count}")
             self._get_matches(matches)
-
+            # print("Type of matches:", type(matches))
+            # print(f"Processed {event_count} events.", end='\r')
         # Now that we finished the input stream, if there were some pending matches somewhere in the tree, we will
         # collect them now
         self._get_last_pending_matches(matches)
@@ -225,4 +229,6 @@ class TreeBasedEvaluationMechanism(EvaluationMechanism, ABC):
         """
         Lets the tree handle the event.
         """
-        raise NotImplementedError()
+        # raise NotImplementedError()
+        # self._play_new_event(event, self._event_types_listeners)
+        # print("Warning: _play_new_event_on_tree is not implemented in the base class!")

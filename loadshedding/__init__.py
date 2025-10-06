@@ -16,6 +16,8 @@ from .AdaptivePatternManager import AdaptivePatternManager
 from .LoadSheddingBenchmark import LoadSheddingBenchmark, SyntheticWorkloadGenerator
 from .PerformanceEvaluator import PerformanceEvaluator
 from .LoadSheddingReporter import LoadSheddingReporter
+from .HotPathPartialMatchManager import HotPathPartialMatchManager, BikeChain
+from .HotPathLoadSheddingStrategy import HotPathLoadSheddingStrategy, LatencyAwareHotPathLoadShedding
 
 __all__ = [
     'LoadMonitor', 'LoadLevel',
@@ -24,5 +26,7 @@ __all__ = [
     'LoadSheddingConfig', 'PresetConfigs', 'LoadSheddingMetrics', 'LoadSheddingSnapshot',
     'LoadAwareInputStream', 'BufferedLoadAwareInputStream', 'AdaptivePatternManager',
     'LoadSheddingBenchmark', 'SyntheticWorkloadGenerator',
-    'PerformanceEvaluator', 'LoadSheddingReporter'
+    'PerformanceEvaluator', 'LoadSheddingReporter',
+    'HotPathPartialMatchManager', 'BikeChain',
+    'HotPathLoadSheddingStrategy', 'LatencyAwareHotPathLoadShedding'
 ]
