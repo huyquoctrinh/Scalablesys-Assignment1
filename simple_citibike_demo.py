@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from city_bike_formatter import CitiBikeCSVFormatter
-from CEP import CEP
+from loadshedding.wrapper import LoadSheddingCEP as CEP
 from stream.Stream import InputStream, OutputStream
 from base.DataFormatter import DataFormatter, EventTypeClassifier
 from base.Event import Event
@@ -37,7 +37,7 @@ import time
 import os
 from datetime import datetime, timedelta
 from base.PatternStructure import SeqOperator, PrimitiveEventStructure, KleeneClosureOperator
-from loadshedding import LoadSheddingConfig, PresetConfigs
+from loadshedding.config import LoadSheddingConfig
 LOAD_SHEDDING_AVAILABLE = True
 
 
@@ -164,8 +164,38 @@ class SimpleCitiBikeDataFormatter(DataFormatter):
         
         # Fallback
         return {"data": str(raw_data)}
-    
+
     def get_event_timestamp(self, event_payload: dict):
+        """Return a datetime (not float) so the engine can do datetime - timedelta."""
+        ts = event_payload.get("ts")
+
+        # Ya es datetime → úsalo tal cual
+        if isinstance(ts, datetime):
+            return ts
+
+        # Cadena ISO → parsear (e.g., '2025-10-03T12:34:56' o '2025-10-03 12:34:56')
+        if isinstance(ts, str):
+            # intenta ISO primero
+            try:
+                return datetime.fromisoformat(ts.replace('Z', '+00:00'))  # tolera 'Z'
+            except Exception:
+                # fallback común: 'YYYY-MM-DD HH:MM:SS'
+                try:
+                    return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass  # seguiremos a siguiente opción
+
+        # Epoch (int/float) → convertir a datetime
+        if isinstance(ts, (int, float)):
+            try:
+                return datetime.fromtimestamp(ts)
+            except Exception:
+                pass
+
+        # Fallback seguro: ahora
+        return datetime.now()
+
+    #def get_event_timestamp(self, event_payload: dict):
         """Extract timestamp from event payload."""
         logger.debug(f"Getting timestamp from payload keys: {list(event_payload.keys())}")
         if "ts" in event_payload:
@@ -182,184 +212,198 @@ class SimpleCitiBikeDataFormatter(DataFormatter):
     def format(self, data):
         return str(data)
 
+class AdjacentChainingKC(KCCondition):
+    def __init__(self, kleene_var="a",
+                 bike_key="bikeid",
+                 start_key="start_station_id",
+                 end_key="end_station_id"):
+
+        def _payload(ev):
+            if isinstance(ev, dict):
+                return ev
+            p = getattr(ev, "payload", None)
+            if p is not None:
+                return p
+            gp = getattr(ev, "get_payload", None)
+            return gp() if callable(gp) else ev
+
+        def _to_int(v):
+            try:
+                return int(v)
+            except Exception:
+                return v  # si no es convertible, lo dejamos tal cual
+
+        def getattr_func(ev):
+            p = _payload(ev)
+            # tuple: (bike, start, end) con cast a int si es posible
+            return (_to_int(p.get(bike_key)),
+                    _to_int(p.get(start_key)),
+                    _to_int(p.get(end_key)))
+
+        def relation_op(prev_tuple, curr_tuple):
+            # misma bici + encadenamiento
+            return (prev_tuple[0] == curr_tuple[0]) and (prev_tuple[2] == curr_tuple[1])
+
+        super().__init__(kleene_var, getattr_func, relation_op)
+
+        self._kleene_var = kleene_var
+        self._bike_key = bike_key
+        self._start_key = start_key
+        self._end_key = end_key
+
+    def _to_payload(self, e):
+        if isinstance(e, dict):
+            return e
+        p = getattr(e, "payload", None)
+        if p is not None:
+            return p
+        gp = getattr(e, "get_payload", None)
+        return gp() if callable(gp) else e
+
+    def _extract_seq(self, ctx):
+        if isinstance(ctx, list):
+            return ctx
+        if isinstance(ctx, dict):
+            return ctx.get(self._kleene_var) or ctx.get("a") or []
+        return []
+
+    def _eval(self, ctx) -> bool:
+        seq = self._extract_seq(ctx)
+        if len(seq) <= 1:
+            return True
+        for prev, curr in zip(seq, seq[1:]):
+            p = self._to_payload(prev)
+            c = self._to_payload(curr)
+
+            if str(p.get(self._bike_key)) != str(c.get(self._bike_key)):
+                return False
+            if str(p.get(self._end_key)) != str(c.get(self._start_key)):
+                return False
+        return True
+
 
 def create_sample_patterns():
-    """Create sample patterns for CitiBike analysis."""
     logger.info("Creating sample patterns...")
     patterns = []
+
+    # Helper function to safely convert station IDs
+    def safe_station_id(x):
+        """Safely convert station ID to integer"""
+        try:
+            return int(float(x["end_station_id"]))
+        except (ValueError, TypeError, KeyError):
+            return 0
     
-    # Pattern 1: Rush hour commute pattern
-    # Pattern 1: Rush hour commute pattern
+    def safe_start_station_id(x):
+        """Safely convert start station ID to integer"""
+        try:
+            return int(float(x["start_station_id"]))
+        except (ValueError, TypeError, KeyError):
+            return 0
+
+    # SEQ( BikeTrip+ a[], BikeTrip b )
+    pattern1_structure = SeqOperator(
+        KleeneClosureOperator(PrimitiveEventStructure("BikeTrip", "a")),
+        PrimitiveEventStructure("BikeTrip", "b")
+    )
+
+    # chain a[]
+    chain_inside_a = AdjacentChainingKC(
+        kleene_var="a",
+        bike_key="bikeid",
+        start_key="start_station_id",
+        end_key="end_station_id"
+    )
+
+    # same bike between a[last] and b
+    same_bike_last_a_b = EqCondition(
+        Variable("a", lambda x: x["bikeid"]),
+        Variable("b", lambda x: x["bikeid"])
+    )
+
+    # b finish in {7,8,9}
+    b_ends_in_target = AndCondition(
+        GreaterThanCondition(Variable("b", safe_station_id), 6),
+        SmallerThanCondition(Variable("b", safe_station_id), 10)
+    )
+
+    pattern1_condition = AndCondition(
+        chain_inside_a,
+        same_bike_last_a_b,
+        b_ends_in_target
+    )
+
     pattern1 = Pattern(
-        SeqOperator(
-            PrimitiveEventStructure("BikeTrip", "a"),
-            PrimitiveEventStructure("BikeTrip", "b")
-        ),
-        AndCondition(
-            EqCondition(Variable("a", lambda x: x["bikeid"]), Variable("b", lambda x: x["bikeid"])),
-            SmallerThanCondition(Variable("b", lambda x: x["ts"].hour), 18),
-            GreaterThanCondition(Variable("b", lambda x: x["ts"].hour), 0),
-            EqCondition(Variable("a", lambda x: x["end_station_id"]), Variable("b", lambda x: x["start_station_id"]))
-        ),
-        3600  # 1 hour in seconds instead of timedelta(hours=1)
+        pattern1_structure,
+        pattern1_condition,
+        timedelta(hours=1)
     )
     pattern1.name = "HotPathDetection"
     patterns.append(pattern1)
+
     logger.info(f"Created {len(patterns)} patterns")
-    
-    # # Pattern 2: Weekend leisure pattern
-    # pattern2 = Pattern()
-    # pattern2.name = "WeekendLeisure" 
-    # patterns.append(pattern2)
-    
-    # # Pattern 3: Long distance trip pattern
-    # pattern3 = Pattern()
-    # pattern3.name = "LongDistanceTrip"
-    # patterns.append(pattern3)
-    
     return patterns
 
-
 def run_basic_citibike_test(csv_file: str, max_events: int = 5000):
-    """Run basic CitiBike load shedding test."""
+    """Run test with load shedding wrapper"""
     
-    if not os.path.exists(csv_file):
-        print(f"Error: CSV file not found: {csv_file}")
-        return
-    
-    print("=" * 60)
-    print("CITIBIKE LOAD SHEDDING DEMONSTRATION")
-    print("=" * 60)
-    print(f"Data file: {csv_file}")
-    print(f"Max events: {max_events}")
-    print(f"Load shedding available: {LOAD_SHEDDING_AVAILABLE}")
-    
-    # Create patterns
-    patterns = create_sample_patterns()
-    
-    # Test configurations
-    configs = {}
-    
-    if LOAD_SHEDDING_AVAILABLE:
-        configs = {
-            'No Load Shedding': LoadSheddingConfig(enabled=False),
-            'Conservative': PresetConfigs.conservative(),
-            'Semantic (CitiBike-tuned)': LoadSheddingConfig(
-                strategy_name='semantic',
-                pattern_priorities={
-                    'RushHourCommute': 9.0,
-                    'WeekendLeisure': 5.0,
-                    'LongDistanceTrip': 7.0
-                },
-                importance_attributes=['importance', 'priority'],
-                memory_threshold=0.7,
-                cpu_threshold=0.8
-            )
-        }
-    else:
-        configs = {'No Load Shedding': None}
+    configs = {
+        'No Load Shedding': None,
+        'Conservative': LoadSheddingConfig(
+            enabled=True,
+            memory_threshold=0.85,
+            shedding_rate=0.15,
+            target_latency_ratio=0.9
+        ),
+        'Balanced': LoadSheddingConfig(
+            enabled=True,
+            memory_threshold=0.70,
+            shedding_rate=0.30,
+            target_latency_ratio=0.5
+        ),
+        'Aggressive': LoadSheddingConfig(
+            enabled=True,
+            memory_threshold=0.50,
+            shedding_rate=0.50,
+            target_latency_ratio=0.3
+        )
+    }
     
     results = {}
     
     for config_name, config in configs.items():
         print(f"\nTesting: {config_name}")
-        print("-" * 40)
         
-        logger.info(f"Creating CEP instance for {config_name}")
-        # Create CEP instance
-        if LOAD_SHEDDING_AVAILABLE and config:
-            logger.info(f"Using load shedding config: {config}")
-            cep = CEP(patterns, load_shedding_config=config)
-        else:
-            logger.info("Creating CEP without load shedding")
-            cep = CEP(patterns)
+        patterns = create_sample_patterns()
         
-        logger.info("Creating streams and data formatter")
-        # Create streams
+        # Create CEP with load shedding (uses wrapper automatically)
+        cep = CEP(patterns, load_shedding_config=config)
+        
         input_stream = SimpleCitiBikeStream(csv_file, max_events)
-        output_stream = SimpleOutputStream(f"output_citybike_{config_name.replace(' ', '_').lower()}.txt")
+        output_stream = SimpleOutputStream(f"output_{config_name}.txt")
         data_formatter = SimpleCitiBikeDataFormatter()
         
-        # Run processing
-        print("  Processing events...")
-        logger.info("Starting CEP processing...")
         start_time = time.time()
-        
-        logger.info("Calling cep.run()...")
         duration = cep.run(input_stream, output_stream, data_formatter)
-        end_time = time.time()
-        logger.info(f"CEP processing completed in {duration:.2f} seconds")
         
-        print(f"  ✓ Completed in {duration:.2f} seconds")
-        print(f"  ✓ Wall clock time: {end_time - start_time:.2f} seconds")
-        print(f"  ✓ Events processed: {input_stream.count}")
-        print(f"  ✓ Matches found: {len(output_stream.get_matches())}")
+        # Get statistics
+        stats = cep.get_load_shedding_statistics()
         
-        # Get load shedding statistics
-        if cep.is_load_shedding_enabled():
-            stats = cep.get_load_shedding_statistics()
-            if stats:
-                print(f"  ✓ Load shedding strategy: {stats['strategy']}")
-                print(f"  ✓ Events dropped: {stats['events_dropped']}")
-                print(f"  ✓ Drop rate: {stats['drop_rate']:.1%}")
-                print(f"  ✓ Current load level: {stats.get('current_load_level', 'unknown')}")
-                print(f"  ✓ Average throughput: {stats.get('avg_throughput_eps', 0):.2f} EPS")
-                
-                results[config_name] = {
-                    'success': True,
-                    'duration': duration,
-                    'wall_clock': end_time - start_time,
-                    'events_processed': input_stream.count,
-                    'matches_found': len(output_stream.get_matches()),
-                    'load_shedding': stats
-                }
-            else:
-                print("  ! Load shedding statistics not available")
-        else:
-            print("  ✓ Load shedding: Disabled")
-            results[config_name] = {
-                'success': True,
-                'duration': duration,
-                'wall_clock': end_time - start_time,
-                'events_processed': input_stream.count,
-                'matches_found': len(output_stream.get_matches()),
-                'load_shedding': None
-            }
-    
-    # Print summary
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    
-    for config_name, result in results.items():
-        print(f"\n{config_name}:")
-        if result['success']:
-            print(f"  Duration: {result['duration']:.2f}s")
-            print(f"  Events: {result['events_processed']}")
-            print(f"  Matches: {result['matches_found']}")
-            
-            if result['load_shedding']:
-                print(f"  Drop Rate: {result['load_shedding']['drop_rate']:.1%}")
-                print(f"  Strategy: {result['load_shedding']['strategy']}")
-        else:
-            print(f"  Error: {result['error']}")
-    
-    # Performance comparison
-    if len([r for r in results.values() if r['success']]) > 1:
-        print(f"\nPERFORMANCE COMPARISON:")
-        print("-" * 25)
+        print(f"  Duration: {duration:.2f}s")
+        print(f"  Matches: {len(output_stream.get_matches())}")
+        if stats:
+            print(f"  Drop Rate: {stats['drop_rate']:.1%}")
+            print(f"  Throughput: {stats.get('avg_throughput_eps', 0):.2f} eps")
         
-        successful_results = [(name, result) for name, result in results.items() if result['success']]
-        baseline = successful_results[0][1]  # Use first successful as baseline
+        results[config_name] = {
+            'duration': duration,
+            'matches': len(output_stream.get_matches()),
+            'load_shedding': stats
+        }
         
-        for name, result in successful_results[1:]:
-            if result['load_shedding']:
-                drop_rate = result['load_shedding']['drop_rate']
-                time_ratio = result['duration'] / baseline['duration']
-                print(f"  {name}:")
-                print(f"    Time vs baseline: {time_ratio:.2f}x")
-                print(f"    Events dropped: {drop_rate:.1%}")
-                print(f"    Matches preserved: {result['matches_found']}/{baseline['matches_found']}")
+        # Reset for next test
+        if config:
+            cep.reset_load_shedding()
     
     return results
 
@@ -371,7 +415,7 @@ def main():
     parser = argparse.ArgumentParser(description='CitiBike Load Shedding Demo')
     parser.add_argument('--csv', default='201309-citibike-tripdata.csv',
                        help='Path to CitiBike CSV file')
-    parser.add_argument('--events', type=int, default=10,
+    parser.add_argument('--events', type=int, default=1000,
                        help='Maximum number of events to process')
     
     args = parser.parse_args()
