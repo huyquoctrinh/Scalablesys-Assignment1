@@ -4,6 +4,7 @@ from misc.Utils import get_first_index, get_last_index
 from datetime import datetime
 from misc.Utils import find_partial_match_by_timestamp
 from condition.Condition import RelopTypes, EquationSides
+from collections import deque
 
 
 class PatternMatchStorage:
@@ -15,7 +16,8 @@ class PatternMatchStorage:
     "regular" container behavior fetching a single value corresponding to this key.
     """
     def __init__(self, get_match_key: callable, sorted_by_arrival_order: bool, clean_up_interval: int):
-        self._partial_matches = []
+        # Use deque for efficient popleft() when cleaning up by arrival order.
+        self._partial_matches = deque()
         if get_match_key is None:
             self._get_key = lambda x: x
         else:
@@ -40,6 +42,7 @@ class PatternMatchStorage:
         """
         Implements list-style "set item" semantics.
         """
+        # deque supports indexing but not efficient insertion at arbitrary index; keep semantics
         self._partial_matches[index] = item
 
     def __getitem__(self, index):
@@ -47,13 +50,19 @@ class PatternMatchStorage:
         Implements list-style "get item" semantics.
         """
         # index can be a slice [:] so the return value can be a list
+        if isinstance(index, slice):
+            # Convert to list for slice returns
+            return list(self._partial_matches)[index]
         return self._partial_matches[index]
 
     def __delitem__(self, index):
         """
         Implements list-style "remove item" semantics.
         """
-        del self._partial_matches[index]
+        # deque doesn't support del by index efficiently; convert to list for this op
+        temp = list(self._partial_matches)
+        del temp[index]
+        self._partial_matches = deque(temp)
 
     def __iter__(self):
         """
@@ -82,17 +91,24 @@ class PatternMatchStorage:
         Removes pattern matches whose earliest earliest_timestamp violates the time window constraint.
         """
         if self._sorted_by_arrival_order:
-            count = find_partial_match_by_timestamp(self._partial_matches, earliest_timestamp)
-            self._partial_matches = self._partial_matches[count:]
+            # find how many items are before the earliest_timestamp
+            temp_list = list(self._partial_matches)
+            count = find_partial_match_by_timestamp(temp_list, earliest_timestamp)
+            # Efficiently popleft 'count' times
+            for _ in range(count):
+                if self._partial_matches:
+                    self._partial_matches.popleft()
         else:
-            self._partial_matches = list(filter(lambda pm: pm.first_timestamp >= earliest_timestamp,
-                                                self._partial_matches))
+            # Filter and recreate deque with only valid items
+            filtered = [pm for pm in self._partial_matches if pm.first_timestamp >= earliest_timestamp]
+            self._partial_matches = deque(filtered)
 
     def get_internal_buffer(self):
         """
         Returns the internal buffer actually storing the pattern matches.
         """
-        return self._partial_matches
+        # Return a list view to avoid exposing the deque for mutation
+        return list(self._partial_matches)
 
     def add(self, pm: PatternMatch):
         """
@@ -268,7 +284,7 @@ class UnsortedPatternMatchStorage(PatternMatchStorage):
         """
         Unconditionally returns all the stored matches regardless of the given value.
         """
-        return self._partial_matches
+        return list(self._partial_matches)
 
 
 class TreeStorageParameters:

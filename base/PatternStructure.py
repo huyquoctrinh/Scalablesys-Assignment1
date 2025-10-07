@@ -7,7 +7,7 @@ from abc import ABC
 from functools import reduce
 
 KC_MIN_SIZE = 1
-KC_MAX_SIZE = None
+KC_MAX_SIZE = 50
 
 
 class PatternStructure(ABC):

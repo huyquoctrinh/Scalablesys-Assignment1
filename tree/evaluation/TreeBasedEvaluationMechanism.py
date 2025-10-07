@@ -40,7 +40,7 @@ class TreeBasedEvaluationMechanism(EvaluationMechanism, ABC):
         self.__optimizer = optimizer
 
         self._event_types_listeners = {}
-        self.__statistics_update_time_window = statistics_update_time_window
+        self.__statistics_update_time_window = statistics_update_time_window.seconds if statistics_update_time_window is not None else None
 
         # The remainder of the initialization process is only relevant for the freeze map feature. This feature can
         # only be enabled in single-pattern mode.
@@ -74,7 +74,7 @@ class TreeBasedEvaluationMechanism(EvaluationMechanism, ABC):
             if not self.__is_multi_pattern_mode and self.__statistics_collector is not None:
                 # TODO: support multi-pattern mode
                 last_statistics_refresh_time = self.__perform_reoptimization(last_statistics_refresh_time, event)
-
+            # print(f"Processing event #{event_count}: {events.}")
             self._play_new_event_on_tree(event, matches)
             self._get_matches(matches)
 

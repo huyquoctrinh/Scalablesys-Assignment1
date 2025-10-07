@@ -113,7 +113,7 @@ class CEP:
             print("Enable load shedding for this CEP run")
             events = self._wrap_with_load_shedding(events)
             self.__metrics_collector.start_collection()
-        # else
+        
         # try:
         print("Starting evaluation...")
         print(f"Evaluation manager type: {type(self.__evaluation_manager)}")

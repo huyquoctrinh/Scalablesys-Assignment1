@@ -5,7 +5,7 @@ from misc.Utils import calculate_joint_probability
 from base.Event import Event, AggregatedEvent
 from condition.CompositeCondition import CompositeCondition
 from base.PatternMatch import PatternMatch
-from misc.Utils import powerset_generator
+# Note: replaced powerset-based expansion with contiguous-only sequences (memory-safe)
 from tree.nodes.Node import Node, PatternParameters
 from tree.nodes.UnaryNode import UnaryNode
 
@@ -15,8 +15,10 @@ class KleeneClosureNode(UnaryNode):
     An internal node representing a Kleene closure operator.
     It generates and propagates sets of partial matches provided by its sole child.
     """
+    from typing import Union
+
     def __init__(self, pattern_params: PatternParameters, min_size, max_size,
-                 parents: List[Node] = None, pattern_ids: int or Set[int] = None):
+                 parents: List[Node] = None, pattern_ids: Union[int, Set[int]] = None):
         super().__init__(pattern_params, parents, pattern_ids)
         self.__min_size = min_size
         self.__max_size = max_size
@@ -57,27 +59,35 @@ class KleeneClosureNode(UnaryNode):
 
     def __create_child_matches_powerset(self):
         """
-        This method is a generator returning all subsets of currently available partial matches of this node child.
-        As this method is always invoked following a notification regarding a new partial match received from the child,
-        only the subsets containing this new partial match (which is assumed to be the last partial match in the child
-        list) are generated.
-        The subsets are enforced to satisfy the minimal and maximal size constraints.
-        The maximal size constraint is enforced recursively to save as many computations as possible.
-        The minimal size constraint on the other hand is enforced via post-processing filtering due to negligible
-        overhead.
+        Memory-optimized replacement for powerset generation.
+        Generates only contiguous subsequences that end with the newest partial match
+        (assumed to be the last item in the child's partial match list). This bounds
+        the number of generated candidates to O(max_size) instead of exponential.
         """
         child_partial_matches = self._child.get_partial_matches()
-        if len(child_partial_matches) == 0:
+        if not child_partial_matches:
             return []
-        last_partial_match = child_partial_matches[-1]
-        # create subsets for all but the last element
+
+        # Index of last (new) partial match
+        last_index = len(child_partial_matches) - 1
+
+        # Determine maximal sequence length we can produce
         actual_max_size = self.__max_size if self.__max_size is not None else len(child_partial_matches)
-        generated_powerset = powerset_generator(child_partial_matches[:-1], actual_max_size - 1)
-        # add the last item to all previously created subsets
-        result_powerset = [item + [last_partial_match] for item in generated_powerset]
-        # enforce minimal size limit
-        result_powerset = [item for item in result_powerset if self.__min_size <= len(item)]
-        return result_powerset
+        actual_max_size = min(actual_max_size, len(child_partial_matches))
+
+        result = []
+        # Generate contiguous sequences that end with the last partial match.
+        # Sizes range from 1..actual_max_size, but enforce minimal size as well.
+        for size in range(1, actual_max_size + 1):
+            if size < self.__min_size:
+                continue
+            start = last_index - size + 1
+            seq = child_partial_matches[start:last_index + 1]
+            result.append(seq)
+
+        # Return sequences ordered by descending size (maintains some backward compatibility)
+        result.sort(key=lambda s: len(s), reverse=True)
+        return result
 
     def apply_condition(self, condition: CompositeCondition):
         """

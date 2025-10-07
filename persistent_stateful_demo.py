@@ -104,22 +104,28 @@ class PersistentCitiBikeDemo:
             save_interval=10  # Save every 10 seconds
         )
         
-        # 2. Create state-aware evaluation mechanism
+        # 2. Prepare patterns first so evaluation mechanism constructor gets them
+        patterns = create_enhanced_patterns()
+        if not patterns:
+            logger.warning("No patterns created; proceeding with delayed registration mode")
+        
+        # 3. Create state-aware evaluation mechanism with initial patterns (if any)
         self.evaluation_mechanism = create_state_aware_evaluation_mechanism(
+            patterns=patterns if patterns else None,
             load_shedding_strategy=self.load_shedding_strategy,
             optimization_interval=30  # Optimize every 30 seconds
         )
         
-        # 3. Create CEP engine with state-aware evaluation
+        # 4. Create CEP engine with state-aware evaluation
         self.cep_engine = CEP(evaluation_mechanism=self.evaluation_mechanism)
         
-        # 4. Register CitiBike patterns
-        patterns = create_enhanced_patterns()
+        # 5. (Patterns already in mechanism) Register them with CEP engine
         for pattern in patterns:
+            # CEP.register_pattern may build internal structures; make sure name attr compatibility
             self.cep_engine.register_pattern(pattern)
-            logger.info(f"Registered pattern: {pattern.pattern_name}")
+            logger.info(f"Registered pattern: {getattr(pattern, 'pattern_name', getattr(pattern, 'name', 'unknown'))}")
         
-        # 5. Create enhanced CitiBike stream with multi-threading
+    # 6. Create enhanced CitiBike stream with multi-threading
         self.stream = EnhancedCitiBikeStream(
             csv_pattern=self.csv_pattern,
             max_workers=self.max_workers,

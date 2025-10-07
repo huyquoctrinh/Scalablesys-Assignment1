@@ -138,6 +138,7 @@ class Node(ABC):
         (1) If the stream is probabilistic, validates the confidence threshold;
         (2) If "single" consumption policy is enabled, validates that the partial match contains no already used events.
         """
+        # print(pm.events)
         if pm.probability is not None:
             # this is a probabilistic stream
             if self._confidence is None:

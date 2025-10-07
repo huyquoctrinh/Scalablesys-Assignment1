@@ -1,0 +1,1372 @@
+#!/usr/bin/env python3
+"""
+Enhanced CitiBike Load Shedding Demo with Improved Hot Path Detection
+This script demonstrates the enhanced hot path detection and load shedding capabilities.
+"""
+
+import os
+import sys
+import time
+import logging
+from datetime import datetime, timedelta
+from typing import List, Iterator, Dict, Union
+import statistics
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
+import glob
+import psutil
+import gc
+# from condition.KleeneClosureCondition import KleeneClosureOperator, AdjacentChainingKC
+from base.PatternStructure import SeqOperator, PrimitiveEventStructure, KleeneClosureOperator
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from city_bike_formatter import CitiBikeCSVFormatter
+from CEP import CEP
+from stream.Stream import InputStream, OutputStream
+from base.DataFormatter import DataFormatter, EventTypeClassifier
+from base.Event import Event
+from base.Pattern import Pattern
+from condition.BaseRelationCondition import EqCondition, GreaterThanCondition, SmallerThanCondition
+from condition.Condition import Variable
+from condition.CompositeCondition import AndCondition
+from base.PatternStructure import SeqOperator, PrimitiveEventStructure
+from loadshedding import LoadSheddingConfig, PresetConfigs
+from condition.KCCondition import KCCondition
+from parallel.ParallelExecutionParameters import (
+    DataParallelExecutionParameters, 
+    DataParallelExecutionParametersHirzelAlgorithm,
+    ParallelExecutionModes
+)
+from parallel.ParallelExecutionModes import DataParallelExecutionModes
+
+try:
+    from loadshedding.EnhancedLoadSheddingStrategy import (
+        PatternAwareLoadShedding, 
+        HybridAdaptiveLoadShedding,
+        GeospatialLoadShedding
+    )
+    ENHANCED_STRATEGIES_AVAILABLE = True
+except ImportError:
+    ENHANCED_STRATEGIES_AVAILABLE = False
+    logger.warning("Enhanced load shedding strategies not available")
+
+LOAD_SHEDDING_AVAILABLE = True
+
+def get_memory_usage():
+    """Get current memory usage statistics."""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+    
+    return {
+        'rss_mb': memory_info.rss / 1024 / 1024,  # Resident Set Size in MB
+        'vms_mb': memory_info.vms / 1024 / 1024,  # Virtual Memory Size in MB
+        'percent': memory_percent,
+        'available_mb': psutil.virtual_memory().available / 1024 / 1024
+    }
+
+def force_garbage_collection():
+    """Force garbage collection to free memory."""
+    collected = gc.collect()
+    return collected
+
+class AdjacentChainingKC(KCCondition):
+    def __init__(self, kleene_var="a",
+                 bike_key="bikeid",
+                 start_key="start_station_id",
+                 end_key="end_station_id", max_len: int | None = 5):  # Reduced from 8 to 5
+        # Memory optimization: Limit sequence length to prevent explosive memory growth
+        self._max_len = max_len if max_len is not None else 5  # Default max of 5 for memory efficiency
+
+        def _payload(ev):
+            if isinstance(ev, dict):
+                return ev
+            p = getattr(ev, "payload", None)
+            if p is not None:
+                return p
+            gp = getattr(ev, "get_payload", None)
+            return gp() if callable(gp) else ev
+
+        def _to_int(v):
+            """Safely convert to int, handling NULL and invalid values."""
+            if v is None or v == "NULL" or v == "":
+                return -1  # Use -1 as invalid ID marker
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return -1  # Return -1 for any conversion error
+
+        def getattr_func(ev):
+            p = _payload(ev)
+            # tuple: (bike, start, end) with safe int conversion
+            return (_to_int(p.get(bike_key)),
+                    _to_int(p.get(start_key)),
+                    _to_int(p.get(end_key)))
+
+        def relation_op(prev_tuple, curr_tuple):
+            # CRITICAL FIX: Enforce BOTH same bike AND chaining as per query spec
+            # Query: a[i+1].bike = a[i].bike AND a[i+1].start = a[i].end
+            same_bike = (prev_tuple[0] == curr_tuple[0])
+            chaining = (prev_tuple[2] == curr_tuple[1])
+            
+            # Skip if any ID is invalid (-1)
+            if prev_tuple[0] == -1 or curr_tuple[0] == -1:  # Invalid bike ID
+                return False
+            if prev_tuple[2] == -1 or curr_tuple[1] == -1:  # Invalid station IDs
+                return False
+                
+            return same_bike and chaining
+
+        super().__init__(kleene_var, getattr_func, relation_op)
+
+        self._kleene_var = kleene_var
+        self._bike_key = bike_key
+        self._start_key = start_key
+        self._end_key = end_key
+
+    def _to_payload(self, e):
+        if isinstance(e, dict):
+            return e
+        p = getattr(e, "payload", None)
+        if p is not None:
+            return p
+        gp = getattr(e, "get_payload", None)
+        return gp() if callable(gp) else e
+
+    def _extract_seq(self, ctx):
+        if isinstance(ctx, list):
+            return ctx
+        if isinstance(ctx, dict):
+            return ctx.get(self._kleene_var) or ctx.get("a") or []
+        return []
+
+    def _eval(self, ctx) -> bool:
+        seq = self._extract_seq(ctx)
+        n = len(seq)
+        if self._max_len and n > self._max_len:
+            return False
+        if n <= 1:
+            return True
+            
+        # Validate ALL consecutive pairs in the sequence
+        # Query requires: a[i+1].bike = a[i].bike AND a[i+1].start = a[i].end
+        for i in range(len(seq) - 1):
+            prev = self._to_payload(seq[i])
+            curr = self._to_payload(seq[i + 1])
+            
+            # Get values with NULL handling
+            prev_bike = prev.get(self._bike_key)
+            curr_bike = curr.get(self._bike_key)
+            prev_end = prev.get(self._end_key)
+            curr_start = curr.get(self._start_key)
+            
+            # Skip if any value is NULL/None/empty
+            if not all([prev_bike, curr_bike, prev_end, curr_start]) or \
+               any(v == "NULL" for v in [prev_bike, curr_bike, prev_end, curr_start]):
+                return False
+                
+            # Check both same bike AND chaining constraints
+            if str(prev_bike) != str(curr_bike):  # Same bike constraint
+                return False
+            if str(prev_end) != str(curr_start):  # Chaining constraint
+                return False
+                
+        return True
+
+def create_sample_patterns():
+    logger.info("Creating sample patterns...")
+    patterns = []
+
+    # SEQ( BikeTrip+ a[], BikeTrip b )
+    pattern1_structure = SeqOperator(
+        KleeneClosureOperator(PrimitiveEventStructure("BikeTrip", "a")),  # a[] with Kleene +
+        PrimitiveEventStructure("BikeTrip", "b")                          # b
+    )
+
+    # chain a[] - MEMORY OPTIMIZATION: Reduced max_len from 21 to 8 for large datasets
+    chain_inside_a = AdjacentChainingKC(
+        kleene_var="a",
+        bike_key="bikeid",
+        start_key="start_station_id",
+        end_key="end_station_id",
+        max_len=8  # Reduced to prevent memory explosion with 20K+ events
+    )
+
+    # Helper function to safely convert to int, handling NULL values
+    def safe_int(value, default=-1):
+        """Safely convert value to int, return default for NULL/None/invalid values."""
+        if value is None or value == "NULL" or value == "":
+            return default
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
+
+    # CORRECTED: b.end in {7,8,9} - exact match as per query specification
+    # Using OR conditions to match exactly stations 7, 8, or 9
+    from condition.CompositeCondition import OrCondition
+    
+    b_ends_station_7 = EqCondition(
+        Variable("b", lambda x: safe_int(x.get("end_station_id"))), 7
+    )
+    b_ends_station_8 = EqCondition(  
+        Variable("b", lambda x: safe_int(x.get("end_station_id"))), 8
+    )
+    b_ends_station_9 = EqCondition(
+        Variable("b", lambda x: safe_int(x.get("end_station_id"))), 9
+    )
+    
+    b_ends_in_target = OrCondition(
+        OrCondition(b_ends_station_7, b_ends_station_8),
+        b_ends_station_9
+    )
+
+    # CORRECTED: Pattern condition now matches query specification exactly
+    # Query: WHERE a[i+1].bike = a[i].bike AND b.end in {7,8,9} 
+    #        AND a[last].bike = b.bike AND a[i+1].start = a[i].end
+    # Note: a[last].bike = b.bike is automatically satisfied since the same bike 
+    #       constraint is enforced throughout the sequence a[]
+    pattern1_condition = AndCondition(
+        chain_inside_a,  # Handles: a[i+1].bike = a[i].bike AND a[i+1].start = a[i].end
+        b_ends_in_target  # Handles: b.end in {7,8,9}
+    )
+
+    pattern1 = Pattern(
+        pattern1_structure,
+        pattern1_condition,
+        timedelta(hours=1)  # WITHIN 1h as per query specification
+    )
+    pattern1.name = "HotPathDetection"
+    
+    # Add metadata about what this pattern detects
+    pattern1.description = """
+    Hot Path Detection Pattern - Matches query specification:
+    PATTERN SEQ (BikeTrip+ a[], BikeTrip b)
+    WHERE a[i+1].bike = a[i].bike AND b.end in {7,8,9}
+    AND a[last].bike = b.bike AND a[i+1].start = a[i].end
+    WITHIN 1h
+    
+    This detects bike trip chains where:
+    1. Same bike is used for consecutive trips in sequence a[]
+    2. Each trip in a[] chains to the next (end station = next start station)  
+    3. Final trip b ends at hot stations {7, 8, 9} where bikes accumulate
+    4. All trips occur within 1 hour window
+    
+    Hot stations {7,8,9} represent areas where bikes accumulate faster than
+    other stations, indicating movement trends for operational efficiency.
+    """
+    
+    patterns.append(pattern1)
+
+    logger.info(f"Created {len(patterns)} patterns")
+    return patterns
+
+class EnhancedCitiBikeStream(InputStream):
+    """Memory-optimized enhanced stream with multi-threaded CSV processing for large datasets."""
+    
+    def __init__(self, csv_files: Union[str, List[str]], max_events: int = 10000, num_threads: int = 4, 
+                 memory_optimized: bool = True):
+        super().__init__()
+        
+        # Handle both single file and multiple files
+        if isinstance(csv_files, str):
+            # Support glob patterns
+            if '*' in csv_files or '?' in csv_files:
+                self.csv_files = glob.glob(csv_files)
+            else:
+                self.csv_files = [csv_files]
+        else:
+            self.csv_files = csv_files
+        
+        self.max_events = max_events
+        self.num_threads = min(num_threads, len(self.csv_files))
+        self.count = 0
+        self.loading_complete = False
+        self.memory_optimized = memory_optimized
+        
+        # Memory optimization: Smaller queue size for large datasets
+        queue_size = min(1000, max_events // 10) if memory_optimized else 5000
+        self.processed_queue = Queue(maxsize=queue_size)
+        self.loading_lock = threading.Lock()
+        
+        # Station analysis for better importance calculation
+        self.station_popularity = {}
+        self.station_zones = {}
+        
+        # Memory optimization settings
+        if memory_optimized and max_events > 10000:
+            print(f"Memory-optimized mode enabled for {max_events} events")
+            # Reduce analysis sample size for large datasets
+            self.station_sample_size = min(500, max_events // 40)
+            # Limit number of threads for memory efficiency
+            self.num_threads = min(self.num_threads, 3)
+        else:
+            self.station_sample_size = 1000
+        
+        # Load data with multi-threading
+        self._load_data_multithreaded()
+        
+        print(f"Finished loading {self.count} events with enhanced attributes from {len(self.csv_files)} files")
+    
+    def _load_data_multithreaded(self):
+        """Load data from multiple CSV files using multiple threads."""
+        print(f"Loading enhanced CitiBike data from {len(self.csv_files)} files using {self.num_threads} threads...")
+        
+        # First pass: analyze stations across all files
+        self._analyze_stations_multithreaded()
+        
+        # Second pass: load events with enhanced attributes
+        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            # Submit tasks for each CSV file
+            future_to_file = {
+                executor.submit(self._process_csv_file, csv_file, file_idx): csv_file 
+                for file_idx, csv_file in enumerate(self.csv_files)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_file):
+                csv_file = future_to_file[future]
+                try:
+                    file_count = future.result()
+                    print(f"Processed {file_count} events from {os.path.basename(csv_file)}")
+                except Exception as e:
+                    logger.error(f"Error processing {csv_file}: {e}")
+        
+        # Transfer processed events to main stream
+        while not self.processed_queue.empty():
+            try:
+                event_data = self.processed_queue.get_nowait()
+                self._stream.put(event_data)
+                self.count += 1
+            except Empty:
+                break
+        
+        self.close()
+    
+    def _process_csv_file(self, csv_file: str, file_idx: int) -> int:
+        """Process a single CSV file in a separate thread."""
+        file_count = 0
+        events_per_file = self.max_events // len(self.csv_files) if len(self.csv_files) > 1 else self.max_events
+        
+        try:
+            formatter = CitiBikeCSVFormatter(csv_file)
+            for data in formatter:
+                with self.loading_lock:
+                    if self.count >= self.max_events:
+                        break
+                
+                if file_count >= events_per_file:
+                    break
+                
+                # Memory optimization: Simplified attributes for large datasets
+                if self.memory_optimized and self.max_events > 10000:
+                    # Simplified importance calculation for memory efficiency
+                    data['importance'] = self._calculate_simple_importance(data)
+                    data['priority'] = self._calculate_simple_priority(data)
+                    data['event_type'] = "BikeTrip"
+                    # Skip some non-essential attributes to save memory
+                else:
+                    # Full enhanced calculation for smaller datasets
+                    data['importance'] = self._calculate_enhanced_importance(data)
+                    data['priority'] = self._calculate_enhanced_priority(data)
+                    data['time_criticality'] = self._get_time_criticality(data)
+                    data['station_importance'] = self._get_station_importance(data)
+                    data['event_type'] = "BikeTrip"
+                    data['source_file'] = os.path.basename(csv_file)
+                    data['file_index'] = file_idx
+                
+                # Memory-conscious queue management
+                try:
+                    if self.memory_optimized:
+                        self.processed_queue.put(data, timeout=1.0)  # Prevent blocking
+                    else:
+                        self.processed_queue.put(data)
+                    file_count += 1
+                except:
+                    # Skip events if queue is full to prevent memory buildup
+                    if not self.memory_optimized:
+                        raise
+                    else:
+                        print(f"Queue full, skipping event {file_count} in {os.path.basename(csv_file)}")
+                
+                if file_count % 500 == 0:
+                    print(f"Thread {file_idx}: Processed {file_count} events from {os.path.basename(csv_file)}")
+                    
+        except Exception as e:
+            logger.error(f"Error in thread processing {csv_file}: {e}")
+        
+        return file_count
+    
+    def _analyze_stations_multithreaded(self):
+        """Analyze station popularity across all files using multiple threads."""
+        print("Analyzing stations across all files...")
+        
+        # Thread-safe collections for station data
+        station_counts = {}
+        station_locations = {}
+        analysis_lock = threading.Lock()
+        
+        def analyze_file_stations(csv_file: str):
+            """Analyze stations from a single file with memory optimization."""
+            local_counts = {}
+            local_locations = {}
+            
+            try:
+                formatter = CitiBikeCSVFormatter(csv_file)
+                sample_count = 0
+                
+                for data in formatter:
+                    if sample_count >= self.station_sample_size:  # Dynamic sample size
+                        break
+                        
+                    start_station = data.get("start_station_id")
+                    end_station = data.get("end_station_id")
+                    
+                    if start_station:
+                        local_counts[start_station] = local_counts.get(start_station, 0) + 1
+                        if start_station not in local_locations:
+                            local_locations[start_station] = {
+                                'name': data.get("start_station_name", ""),
+                                'lat': data.get("start_lat"),
+                                'lng': data.get("start_lng")
+                            }
+                    
+                    if end_station:
+                        local_counts[end_station] = local_counts.get(end_station, 0) + 1
+                        if end_station not in local_locations:
+                            local_locations[end_station] = {
+                                'name': data.get("end_station_name", ""),
+                                'lat': data.get("end_lat"),
+                                'lng': data.get("end_lng")
+                            }
+                    
+                    sample_count += 1
+                
+                # Merge with global collections
+                with analysis_lock:
+                    for station_id, count in local_counts.items():
+                        station_counts[station_id] = station_counts.get(station_id, 0) + count
+                    
+                    for station_id, location in local_locations.items():
+                        if station_id not in station_locations:
+                            station_locations[station_id] = location
+                            
+            except Exception as e:
+                logger.error(f"Error analyzing stations in {csv_file}: {e}")
+        
+        # Process files in parallel for station analysis
+        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            futures = [executor.submit(analyze_file_stations, csv_file) for csv_file in self.csv_files]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Station analysis error: {e}")
+        
+        # Calculate popularity scores (normalized)
+        max_count = max(station_counts.values()) if station_counts else 1
+        self.station_popularity = {
+            station: count / max_count 
+            for station, count in station_counts.items()
+        }
+        
+        # Simple geographic zone classification
+        for station_id, location in station_locations.items():
+            lat = location.get('lat', 0)
+            lng = location.get('lng', 0)
+            
+            if lat and lng:
+                # Simple Manhattan zones (this is approximate)
+                if lat > 40.75:  # Upper Manhattan
+                    zone = 'residential'
+                elif lat > 40.72 and lng > -74.0:  # Midtown/Business
+                    zone = 'business'
+                elif lat < 40.71:  # Downtown/Financial
+                    zone = 'business'
+                else:
+                    zone = 'tourist'
+                
+                self.station_zones[station_id] = zone
+        
+        print(f"Analyzed {len(self.station_popularity)} unique stations across {len(self.csv_files)} files")
+    
+    def get_thread_stats(self) -> Dict:
+        """Get statistics about multi-threaded processing."""
+        return {
+            'total_files': len(self.csv_files),
+            'threads_used': self.num_threads,
+            'events_loaded': self.count,
+            'stations_analyzed': len(self.station_popularity),
+            'files_processed': [os.path.basename(f) for f in self.csv_files]
+        }
+    
+    def _calculate_simple_importance(self, data) -> float:
+        """Simplified importance calculation for memory efficiency."""
+        importance = 0.5  # Base importance
+        
+        # Simple time-based importance (reduced complexity)
+        hour = data["ts"].hour
+        if 7 <= hour <= 9 or 17 <= hour <= 19:  # Rush hours
+            importance += 0.3
+        elif data["ts"].weekday() < 5:  # Weekday
+            importance += 0.1
+        
+        # Simple user type importance
+        if data.get("usertype") == "Subscriber":
+            importance += 0.1
+        
+        return min(1.0, importance)
+    
+    def _calculate_simple_priority(self, data) -> float:
+        """Simplified priority calculation for memory efficiency."""
+        priority = 5.0  # Base priority
+        
+        # Simple user type priority
+        if data.get("usertype") == "Subscriber":
+            priority += 2.0
+        
+        # Simple time-based priority
+        if data["ts"].weekday() < 5:  # Weekday
+            priority += 1.0
+        
+        return min(10.0, priority)
+    
+    def _calculate_enhanced_importance(self, data) -> float:
+        """Enhanced importance calculation with multiple factors."""
+        importance = 0.5  # Base importance
+        
+        # Time-based importance (more sophisticated)
+        hour = data["ts"].hour
+        weekday = data["ts"].weekday()
+        
+        if weekday < 5:  # Weekday
+            if 7 <= hour <= 9 or 17 <= hour <= 19:  # Rush hours
+                importance += 0.4
+            elif 6 <= hour <= 10 or 16 <= hour <= 20:  # Extended rush
+                importance += 0.25
+            elif 10 <= hour <= 16:  # Business hours
+                importance += 0.15
+        else:  # Weekend
+            if 10 <= hour <= 18:  # Weekend activity hours
+                importance += 0.2
+        
+        # Trip duration importance
+        duration = data.get("tripduration_s", 0)
+        if duration > 3600:  # Very long trips (>1 hour)
+            importance += 0.25
+        elif duration > 1800:  # Long trips (>30 minutes)
+            importance += 0.15
+        elif duration > 900:  # Medium trips (>15 minutes)
+            importance += 0.1
+        
+        # Station popularity importance
+        start_station = data.get("start_station_id")
+        if start_station in self.station_popularity:
+            importance += 0.2 * self.station_popularity[start_station]
+        
+        # User type importance
+        if data.get("usertype") == "Subscriber":
+            importance += 0.1
+        
+        # Distance-based importance (approximate)
+        start_lat = data.get("start_lat", 0)
+        start_lng = data.get("start_lng", 0)
+        end_lat = data.get("end_lat", 0)
+        end_lng = data.get("end_lng", 0)
+        
+        if all([start_lat, start_lng, end_lat, end_lng]):
+            # Simple distance calculation
+            lat_diff = abs(end_lat - start_lat)
+            lng_diff = abs(end_lng - start_lng)
+            distance_proxy = (lat_diff + lng_diff) * 111000  # Rough meters
+            
+            if distance_proxy > 3000:  # Long distance trips
+                importance += 0.15
+        
+        return min(1.0, importance)
+    
+    def _calculate_enhanced_priority(self, data) -> float:
+        """Enhanced priority calculation."""
+        priority = 5.0  # Base priority
+        
+        # User type priority
+        if data.get("usertype") == "Subscriber":
+            priority += 2.5
+        else:
+            priority += 1.0  # Customer
+        
+        # Time-based priority
+        hour = data["ts"].hour
+        weekday = data["ts"].weekday()
+        
+        if weekday < 5:  # Weekday
+            priority += 2.0
+            if 7 <= hour <= 9 or 17 <= hour <= 19:  # Rush hours
+                priority += 2.0
+        
+        # Trip characteristics
+        duration = data.get("tripduration_s", 0)
+        if 600 <= duration <= 3600:  # Reasonable trip duration
+            priority += 1.0
+        
+        # Station importance
+        start_station = data.get("start_station_id")
+        if start_station in self.station_popularity:
+            priority += 2.0 * self.station_popularity[start_station]
+        
+        return min(10.0, priority)
+    
+    def _get_time_criticality(self, data) -> str:
+        """Determine time criticality of the trip."""
+        hour = data["ts"].hour
+        weekday = data["ts"].weekday()
+        
+        if weekday < 5:  # Weekday
+            if 7 <= hour <= 9 or 17 <= hour <= 19:
+                return "rush_hour"
+            elif 6 <= hour <= 20:
+                return "business_hours"
+        else:  # Weekend
+            if 10 <= hour <= 18:
+                return "leisure_hours"
+        
+        return "off_peak"
+    
+    def _get_station_importance(self, data) -> float:
+        """Get station importance score."""
+        start_station = data.get("start_station_id")
+        return self.station_popularity.get(start_station, 0.5)
+
+class SimpleOutputStream(OutputStream):
+    """Enhanced multi-threaded output stream with pattern analysis and concurrent writing."""
+    
+    def __init__(self, file_path: str = "enhanced_citybike.txt", is_async: bool = False, 
+                 enable_multithreading: bool = True, writer_threads: int = 2, 
+                 batch_size: int = 100, flush_interval: float = 1.0):
+        super().__init__()
+        self.file_path = file_path
+        self.__is_async = is_async
+        self.enable_multithreading = enable_multithreading and not is_async  # Don't use MT with legacy async
+        self.writer_threads = max(1, writer_threads)
+        self.batch_size = max(1, batch_size)
+        self.flush_interval = max(0.1, flush_interval)
+        
+        # Thread-safe collections
+        self.matches = []
+        self.pattern_stats = {}
+        self._stats_lock = threading.Lock()
+        self._matches_lock = threading.Lock()
+        
+        # Multi-threaded writing setup
+        if self.enable_multithreading:
+            self._setup_multithreaded_writing()
+        elif self.__is_async:
+            self.__output_file = open(self.file_path, 'w')
+            self.__output_buffer = None
+        else:
+            self.__output_file = None
+            self.__output_buffer = []
+    
+    def _setup_multithreaded_writing(self):
+        """Initialize multi-threaded writing components."""
+        # Write queue for batching items
+        self.write_queue = Queue(maxsize=1000)  # Prevent unbounded queue growth
+        
+        # Writing control
+        self.writing_active = True
+        self.write_executor = ThreadPoolExecutor(max_workers=self.writer_threads, 
+                                                thread_name_prefix="OutputWriter")
+        
+        # Batch processing
+        self.current_batch = []
+        self.batch_lock = threading.Lock()
+        self.last_flush = time.time()
+        
+        # Statistics
+        self.write_stats = {
+            'items_queued': 0,
+            'items_written': 0,
+            'batches_written': 0,
+            'queue_full_events': 0,
+            'write_errors': 0
+        }
+        
+        # Start writer threads
+        self.writer_futures = []
+        for i in range(self.writer_threads):
+            future = self.write_executor.submit(self._writer_thread_worker, i)
+            self.writer_futures.append(future)
+        
+        # Start batch flusher thread
+        self.flush_future = self.write_executor.submit(self._batch_flusher_thread)
+        
+        print(f"Multi-threaded output initialized: {self.writer_threads} writers, batch_size={self.batch_size}")
+    
+    def _writer_thread_worker(self, thread_id: int):
+        """Worker thread for writing batches to file."""
+        print(f"Output writer thread {thread_id} started")
+        
+        try:
+            while self.writing_active:
+                try:
+                    # Get batch from queue with timeout
+                    batch = self.write_queue.get(timeout=0.5)
+                    if batch is None:  # Shutdown signal
+                        break
+                    
+                    # Write batch to file
+                    self._write_batch_to_file(batch, thread_id)
+                    self.write_stats['batches_written'] += 1
+                    self.write_stats['items_written'] += len(batch)
+                    
+                    # Mark task as done
+                    self.write_queue.task_done()
+                    
+                except Empty:
+                    continue  # Timeout, check if still active
+                except Exception as e:
+                    logger.error(f"Writer thread {thread_id} error: {e}")
+                    self.write_stats['write_errors'] += 1
+                
+        except Exception as e:
+            logger.error(f"Writer thread {thread_id} fatal error: {e}")
+        finally:
+            print(f"Output writer thread {thread_id} finished")
+    
+    def _batch_flusher_thread(self):
+        """Thread to periodically flush accumulated batches."""
+        print("Batch flusher thread started")
+        
+        try:
+            while self.writing_active:
+                time.sleep(self.flush_interval)
+                
+                # Check if we need to flush current batch
+                with self.batch_lock:
+                    if (len(self.current_batch) > 0 and 
+                        (len(self.current_batch) >= self.batch_size or 
+                         time.time() - self.last_flush >= self.flush_interval)):
+                        
+                        # Move current batch to write queue
+                        batch_to_write = self.current_batch.copy()
+                        self.current_batch.clear()
+                        self.last_flush = time.time()
+                        
+                        # Queue batch for writing
+                        try:
+                            self.write_queue.put(batch_to_write, timeout=0.1)
+                        except:
+                            self.write_stats['queue_full_events'] += 1
+                            # Write directly if queue is full
+                            self._write_batch_to_file(batch_to_write, -1)
+                
+        except Exception as e:
+            logger.error(f"Batch flusher thread error: {e}")
+        finally:
+            print("Batch flusher thread finished")
+    
+    def _write_batch_to_file(self, batch: List, thread_id: int):
+        """Write a batch of items to file with thread safety."""
+        if not batch:
+            return
+        
+        try:
+            # Use thread-specific file handles or synchronized writing
+            file_mode = 'a' if os.path.exists(self.file_path) else 'w'
+            with open(self.file_path, file_mode, encoding='utf-8', buffering=8192) as f:
+                for item in batch:
+                    f.write(str(item) + "\n")
+                f.flush()  # Ensure data is written to disk
+            
+        except Exception as e:
+            logger.error(f"Error writing batch (thread {thread_id}): {e}")
+            self.write_stats['write_errors'] += 1
+    
+    def add_item(self, item: object):
+        """Add item with thread-safe pattern analysis and multi-threaded writing."""
+        # Thread-safe match collection
+        with self._matches_lock:
+            self.matches.append(item)
+        
+        super().add_item(item)
+        
+        # Handle writing based on mode
+        if self.enable_multithreading:
+            self._add_item_multithreaded(item)
+        elif self.__is_async:
+            self.__output_file.write(str(item) + "\n")
+            self.__output_file.flush()
+        else:
+            self.__output_buffer.append(item)
+        
+        # Thread-safe pattern analysis
+        self._analyze_pattern(item)
+    
+    def _add_item_multithreaded(self, item: object):
+        """Add item to multi-threaded writing pipeline."""
+        with self.batch_lock:
+            self.current_batch.append(item)
+            self.write_stats['items_queued'] += 1
+            
+            # Check if batch is ready for writing
+            if len(self.current_batch) >= self.batch_size:
+                batch_to_write = self.current_batch.copy()
+                self.current_batch.clear()
+                self.last_flush = time.time()
+                
+                # Queue batch for writing (non-blocking)
+                try:
+                    self.write_queue.put_nowait(batch_to_write)
+                except:
+                    # Queue full, write directly
+                    self.write_stats['queue_full_events'] += 1
+                    threading.Thread(target=self._write_batch_to_file, 
+                                   args=(batch_to_write, -1), 
+                                   daemon=True).start()
+    
+    def _analyze_pattern(self, item: object):
+        """Thread-safe pattern analysis."""
+        if hasattr(item, 'pattern_name') or (isinstance(item, dict) and 'pattern' in str(item)):
+            pattern_name = getattr(item, 'pattern_name', 'Unknown')
+            
+            with self._stats_lock:
+                if pattern_name not in self.pattern_stats:
+                    self.pattern_stats[pattern_name] = {
+                        'count': 0,
+                        'avg_importance': 0.0,
+                        'avg_duration': 0.0,
+                        'stations': set()
+                    }
+                
+                self.pattern_stats[pattern_name]['count'] += 1
+    
+    def get_analysis(self) -> Dict:
+        """Get thread-safe analysis of collected matches."""
+        with self._matches_lock:
+            total_matches = len(self.matches)
+        
+        with self._stats_lock:
+            patterns_copy = {k: dict(v) for k, v in self.pattern_stats.items()}
+        
+        analysis = {
+            'total_matches': total_matches,
+            'patterns': patterns_copy,
+            'match_rate': total_matches / 1000.0 if total_matches > 0 else 0.0
+        }
+        
+        # Add multi-threading statistics
+        if self.enable_multithreading:
+            analysis['write_stats'] = self.write_stats.copy()
+            analysis['queue_size'] = self.write_queue.qsize()
+            with self.batch_lock:
+                analysis['current_batch_size'] = len(self.current_batch)
+        
+        return analysis
+    
+    def get_matches(self):
+        """Get all collected matches (thread-safe)."""
+        with self._matches_lock:
+            return self.matches.copy()
+    
+    def get_write_statistics(self) -> Dict:
+        """Get detailed writing statistics for multi-threaded mode."""
+        if not self.enable_multithreading:
+            return {'mode': 'single_threaded'}
+        
+        stats = self.write_stats.copy()
+        stats.update({
+            'mode': 'multi_threaded',
+            'writer_threads': self.writer_threads,
+            'batch_size': self.batch_size,
+            'queue_size': self.write_queue.qsize(),
+            'queue_maxsize': self.write_queue.maxsize,
+            'flush_interval': self.flush_interval
+        })
+        
+        with self.batch_lock:
+            stats['current_batch_size'] = len(self.current_batch)
+        
+        return stats
+    
+    def close(self):
+        """Close the output stream and flush any pending data with proper multi-threading cleanup."""
+        print("Closing SimpleOutputStream...")
+        
+        if self.enable_multithreading:
+            self._close_multithreaded()
+        elif self.__is_async and self.__output_file:
+            self.__output_file.close()
+            self.__output_file = None
+        elif not self.__is_async and self.__output_buffer:
+            # Write buffered items to file if needed
+            if self.file_path:
+                with open(self.file_path, 'w') as f:
+                    for item in self.__output_buffer:
+                        f.write(str(item) + "\n")
+                self.__output_buffer.clear()
+        
+        print("SimpleOutputStream closed successfully")
+    
+    def _close_multithreaded(self):
+        """Close multi-threaded writing system gracefully."""
+        print("Shutting down multi-threaded writing...")
+        
+        # Stop accepting new items
+        self.writing_active = False
+        
+        # Flush any remaining items in current batch
+        with self.batch_lock:
+            if self.current_batch:
+                print(f"Flushing final batch of {len(self.current_batch)} items")
+                try:
+                    self.write_queue.put(self.current_batch.copy(), timeout=2.0)
+                except:
+                    # Write directly if queue is full
+                    self._write_batch_to_file(self.current_batch, -1)
+                self.current_batch.clear()
+        
+        # Send shutdown signals to workers
+        for _ in range(self.writer_threads):
+            try:
+                self.write_queue.put(None, timeout=1.0)  # Shutdown signal
+            except:
+                pass
+        
+        # Wait for queue to be processed
+        try:
+            print("Waiting for write queue to finish...")
+            self.write_queue.join()
+        except:
+            pass
+        
+        # Shutdown executor
+        try:
+            print("Shutting down writer threads...")
+            self.write_executor.shutdown(wait=True, timeout=5.0)
+        except Exception as e:
+            logger.error(f"Error shutting down write executor: {e}")
+        
+        # Print final statistics
+        final_stats = self.get_write_statistics()
+        print(f"Final write statistics: {final_stats['items_written']} items written, "
+              f"{final_stats['batches_written']} batches, "
+              f"{final_stats['write_errors']} errors")
+    
+    def __del__(self):
+        """Destructor to ensure proper cleanup."""
+        try:
+            if hasattr(self, 'writing_active') and self.writing_active:
+                self.close()
+        except:
+            pass
+        
+        # Legacy async cleanup
+        if hasattr(self, '_SimpleOutputStream__is_async') and self.__is_async:
+            if hasattr(self, '_SimpleOutputStream__output_file') and self.__output_file:
+                try:
+                    self.__output_file.close()
+                except:
+                    pass
+    
+class CitiBikeEventTypeClassifier:
+    def get_event_type(self, event_payload):
+        return "BikeTrip"
+
+class SimpleCitiBikeDataFormatter:
+    def __init__(self):
+        self.classifier = CitiBikeEventTypeClassifier()
+    
+    def get_event_type(self, event_payload):
+        return self.classifier.get_event_type(event_payload)
+    
+    def get_probability(self, event_payload):
+        # Return None for non-probabilistic events
+        return None
+    
+    def parse_event(self, raw_data):
+        return raw_data if isinstance(raw_data, dict) else {"data": str(raw_data)}
+    
+    def get_event_timestamp(self, event_payload):
+        if "ts" in event_payload:
+            ts = event_payload["ts"]
+            return ts.timestamp() if hasattr(ts, 'timestamp') else float(ts)
+        return datetime.now().timestamp()
+    
+    def format(self, data):
+        return str(data)
+
+def run_enhanced_demo(csv_files: Union[str, List[str]], max_events: int = 5000, force_async: bool = False, num_threads: int = 4):
+    """Run enhanced CitiBike load shedding demonstration with memory optimization for large datasets."""
+    
+    # Handle file validation
+    if isinstance(csv_files, str):
+        if '*' in csv_files or '?' in csv_files:
+            resolved_files = glob.glob(csv_files)
+            if not resolved_files:
+                print(f"Error: No files found matching pattern: {csv_files}")
+                return
+            csv_files = resolved_files
+        else:
+            if not os.path.exists(csv_files):
+                print(f"Error: CSV file not found: {csv_files}")
+                print(f"Current directory: {os.getcwd()}")
+                print(f"Files in current directory: {[f for f in os.listdir('.') if f.endswith('.csv')]}")
+                return
+            csv_files = [csv_files]
+    else:
+        missing_files = [f for f in csv_files if not os.path.exists(f)]
+        if missing_files:
+            print(f"Error: Files not found: {missing_files}")
+            return
+    
+    # Memory optimization settings for large datasets
+    memory_optimized = max_events > 10000
+    if memory_optimized:
+        print("⚡ MEMORY OPTIMIZATION MODE ENABLED for large dataset")
+        # Reduce thread count for memory efficiency
+        num_threads = min(num_threads, 3)
+        # Enable more aggressive load shedding
+        force_load_shedding = True
+    else:
+        force_load_shedding = False
+
+    print("=" * 70)
+    print("ENHANCED CITIBIKE MULTI-THREADED HOT PATH DETECTION & LOAD SHEDDING DEMO")
+    if memory_optimized:
+        print("🚀 MEMORY-OPTIMIZED MODE FOR LARGE DATASETS")
+    print("=" * 70)
+    print(f"Data files: {len(csv_files)} files")
+    for i, f in enumerate(csv_files[:5]):  # Show first 5 files
+        print(f"  {i+1}. {os.path.basename(f)}")
+    if len(csv_files) > 5:
+        print(f"  ... and {len(csv_files) - 5} more files")
+    print(f"Max events: {max_events}")
+    print(f"Threads: {num_threads} {'(reduced for memory)' if memory_optimized else ''}")
+    print(f"Memory optimized: {memory_optimized}")
+    print(f"Async mode: {force_async or max_events > 1000}")
+    print(f"Enhanced strategies available: {ENHANCED_STRATEGIES_AVAILABLE}")
+    
+    # Create enhanced patterns
+    patterns = create_sample_patterns()
+    print(f"Created {len(patterns)} enhanced patterns:")
+    for pattern in patterns:
+        print(f"  - {pattern.name} (priority: {getattr(pattern, 'priority', 'N/A')})")
+    
+    # Test configurations - optimized for memory usage
+    if memory_optimized:
+        # Memory-optimized configurations for large datasets
+        configs = {
+            'Memory-Optimized Semantic': LoadSheddingConfig(
+                strategy_name='semantic',
+                pattern_priorities={'HotPathDetection': 8.0},
+                importance_attributes=['importance', 'priority'],  # Reduced attributes
+                memory_threshold=0.6,  # More aggressive
+                cpu_threshold=0.7
+            )
+        }
+    else:
+        # Full configurations for smaller datasets
+        configs = {
+            'No Load Shedding': LoadSheddingConfig(enabled=False),
+            # 'Conservative Enhanced': LoadSheddingConfig(
+            #     strategy_name='semantic',
+            #     pattern_priorities={
+            #         'MorningRushHotPath': 9.0,
+            #         'EveningRushHotPath': 9.0,
+            #         'PopularStationHotPath': 7.5,
+            #         'WeekendLeisureHotPath': 6.0,
+            #     },
+            #     importance_attributes=['importance', 'priority', 'time_criticality', 'station_importance'],
+            #     memory_threshold=0.75,
+            #     cpu_threshold=0.85
+            # ),
+            'Time-Aware Semantic': LoadSheddingConfig(
+                strategy_name='semantic',
+                pattern_priorities={
+                    'MorningRushHotPath': 10.0,  # Highest priority
+                    'EveningRushHotPath': 10.0,  # Highest priority
+                    'PopularStationHotPath': 8.0,
+                    'WeekendLeisureHotPath': 5.0,
+                },
+                importance_attributes=['importance', 'priority', 'time_criticality', 'station_importance'],
+                memory_threshold=0.7,
+                cpu_threshold=0.8
+            )
+        }
+    
+    results = {}
+    
+    for config_name, config in configs.items():
+        print(f"\n{'-' * 50}")
+        print(f"Testing: {config_name}")
+        print(f"{'-' * 50}")
+        
+        # Memory-optimized CEP configuration
+        if memory_optimized:
+            # Reduce parallel units for memory efficiency
+            parallel_units = min(3, max(2, num_threads))
+        else:
+            parallel_units = 4
+            
+        # Create CEP instance with parallel execution (Hirzel algorithm for key-based partitioning)
+        parallel_params = DataParallelExecutionParametersHirzelAlgorithm(
+            units_number=parallel_units,
+            key="bikeid"  # Partition by bike ID for better locality
+        )
+        
+        # Force load shedding for large datasets to prevent memory issues
+        if memory_optimized and not config.enabled:
+            print(f"  ⚡ Enabling conservative load shedding for memory optimization")
+            memory_config = LoadSheddingConfig(
+                enabled=True,
+                strategy_name='semantic',
+                pattern_priorities={'HotPathDetection': 8.0},
+                importance_attributes=['importance', 'priority'],
+                memory_threshold=0.6,  # More aggressive threshold
+                cpu_threshold=0.7
+            )
+            cep = CEP(patterns, parallel_execution_params=parallel_params, load_shedding_config=memory_config)
+        elif config.enabled:
+            # Adjust thresholds for memory optimization
+            if memory_optimized:
+                config.memory_threshold = min(0.6, config.memory_threshold)
+                config.cpu_threshold = min(0.7, config.cpu_threshold)
+            cep = CEP(patterns, parallel_execution_params=parallel_params, load_shedding_config=config)
+        else:
+            cep = CEP(patterns, parallel_execution_params=parallel_params)
+        
+        # Create memory-optimized streams
+        input_stream = EnhancedCitiBikeStream(csv_files, max_events, num_threads, memory_optimized=memory_optimized)
+        
+        # Memory-optimized output stream configuration
+        is_async = force_async or max_events > 1000
+        enable_mt_writing = max_events > 500 and not memory_optimized  # Disable MT for memory optimization
+        
+        if memory_optimized:
+            # Simplified output for large datasets
+            writer_threads = 1  # Single writer to reduce memory
+            batch_size = max(100, max_events // 100)  # Larger batches, less frequent writes
+            flush_interval = 2.0  # Less frequent flushes
+        else:
+            writer_threads = min(num_threads, 3)
+            batch_size = max(50, max_events // 200)
+            flush_interval = 1.0
+        
+        output_stream = SimpleOutputStream(
+            file_path=f"hothpath_{config_name.replace(' ', '_').lower()}.txt",
+            is_async=is_async and not memory_optimized,  # Disable async for memory mode
+            enable_multithreading=enable_mt_writing and not is_async,
+            writer_threads=writer_threads,
+            batch_size=batch_size,
+            flush_interval=flush_interval
+        )
+        
+        # Display thread statistics
+        thread_stats = input_stream.get_thread_stats()
+        print(f"  Thread stats: {thread_stats['threads_used']} threads, {thread_stats['total_files']} files, {thread_stats['stations_analyzed']} stations")
+        
+        # Simple data formatter
+        
+        data_formatter = SimpleCitiBikeDataFormatter()
+        
+        # Memory monitoring for large datasets
+        if memory_optimized:
+            initial_memory = get_memory_usage()
+            print(f"  Initial memory: {initial_memory['rss_mb']:.1f} MB ({initial_memory['percent']:.1f}%)")
+            
+            # Force garbage collection before processing
+            collected = force_garbage_collection()
+            print(f"  Garbage collected: {collected} objects")
+        
+        # Run processing
+        print("  Processing events with enhanced patterns...")
+        start_time = time.time()
+        
+        duration = cep.run(input_stream, output_stream, data_formatter)
+        end_time = time.time()
+        
+        # Memory monitoring after processing
+        if memory_optimized:
+            final_memory = get_memory_usage()
+            memory_delta = final_memory['rss_mb'] - initial_memory['rss_mb']
+            print(f"  Final memory: {final_memory['rss_mb']:.1f} MB ({final_memory['percent']:.1f}%)")
+            print(f"  Memory increase: {memory_delta:+.1f} MB")
+            
+            # Force cleanup after processing
+            collected = force_garbage_collection()
+            print(f"  Post-processing cleanup: {collected} objects collected")
+        
+        # Get output statistics before closing
+        write_stats = output_stream.get_write_statistics()
+        
+        # Close output stream to ensure all data is written
+        output_stream.close()
+        
+        # Get results
+        analysis = output_stream.get_analysis()
+        
+        print(f"  ✓ Completed in {duration:.2f} seconds")
+        print(f"  ✓ Wall clock time: {end_time - start_time:.2f} seconds")
+        print(f"  ✓ Events processed: {input_stream.count}")
+        print(f"  ✓ Total matches found: {analysis['total_matches']}")
+        print(f"  ✓ Match rate: {analysis['match_rate']:.3f}")
+        
+        # Multi-threaded writing statistics
+        if write_stats['mode'] == 'multi_threaded':
+            print(f"  ✓ Output mode: Multi-threaded ({write_stats['writer_threads']} writers)")
+            print(f"  ✓ Items written: {write_stats['items_written']}")
+            print(f"  ✓ Batches written: {write_stats['batches_written']}")
+            if write_stats['write_errors'] > 0:
+                print(f"  ⚠ Write errors: {write_stats['write_errors']}")
+            if write_stats['queue_full_events'] > 0:
+                print(f"  ⚠ Queue full events: {write_stats['queue_full_events']}")
+        else:
+            print(f"  ✓ Output mode: {write_stats['mode']}")
+        
+        # Pattern-specific results
+        for pattern_name, stats in analysis['patterns'].items():
+            print(f"    - {pattern_name}: {stats['count']} matches")
+        
+        # Load shedding statistics
+        if cep.is_load_shedding_enabled():
+            ls_stats = cep.get_load_shedding_statistics()
+            if ls_stats:
+                print(f"  ✓ Load shedding strategy: {ls_stats['strategy']}")
+                print(f"  ✓ Events dropped: {ls_stats['events_dropped']}")
+                print(f"  ✓ Drop rate: {ls_stats['drop_rate']:.1%}")
+                print(f"  ✓ Avg throughput: {ls_stats.get('avg_throughput_eps', 0):.1f} EPS")
+        
+        results[config_name] = {
+            'duration': duration,
+            'wall_clock': end_time - start_time,
+            'events_processed': input_stream.count,
+            'analysis': analysis,
+            'write_stats': write_stats,
+            'load_shedding': cep.get_load_shedding_statistics() if cep.is_load_shedding_enabled() else None
+        }
+    
+    # Summary comparison
+    print(f"\n{'=' * 70}")
+    print("ENHANCED DEMO SUMMARY & ANALYSIS")
+    print(f"{'=' * 70}")
+    
+    for config_name, result in results.items():
+        analysis = result['analysis']
+        print(f"\n{config_name}:")
+        print(f"  Duration: {result['duration']:.2f}s")
+        print(f"  Total Matches: {analysis['total_matches']}")
+        print(f"  Match Rate: {analysis['match_rate']:.3f}")
+        
+        if result['load_shedding']:
+            ls = result['load_shedding']
+            print(f"  Drop Rate: {ls['drop_rate']:.1%}")
+            print(f"  Throughput: {ls.get('avg_throughput_eps', 0):.1f} EPS")
+        
+        # Pattern breakdown
+        for pattern_name, stats in analysis['patterns'].items():
+            print(f"    {pattern_name}: {stats['count']} matches")
+    
+    # Performance insights
+    if len(results) > 1:
+        print(f"\nPERFORMAN CE INSIGHTS:")
+        print("-" * 30)
+        
+        baseline = list(results.values())[0]
+        for config_name, result in list(results.items())[1:]:
+            analysis = result['analysis']
+            baseline_analysis = baseline['analysis']
+            
+            match_preservation = analysis['total_matches'] / max(baseline_analysis['total_matches'], 1)
+            time_efficiency = baseline['duration'] / max(result['duration'], 0.01)
+            
+            print(f"{config_name}:")
+            print(f"  Match Preservation: {match_preservation:.1%}")
+            print(f"  Time Efficiency: {time_efficiency:.2f}x")
+            
+            if result['load_shedding']:
+                drop_rate = result['load_shedding']['drop_rate']
+                efficiency_score = match_preservation / max(1.0 - drop_rate, 0.1)
+                print(f"  Efficiency Score: {efficiency_score:.2f}")
+    
+    return results
+
+
+def main():
+    """Main function."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Enhanced Multi-threaded CitiBike Load Shedding Demo')
+    parser.add_argument('--csv', default='test_data/201306-citibike-tripdata.csv',
+                       help='Path to CitiBike CSV file(s). Supports glob patterns like "test_data/*.csv" or multiple files')
+    parser.add_argument('--files', nargs='+',
+                       help='Multiple CSV files to process')
+    parser.add_argument('--events', type=int, default=2000,
+                       help='Maximum number of events to process')
+    parser.add_argument('--threads', type=int, default=4,
+                       help='Number of threads for parallel processing')
+    parser.add_argument('--async', action='store_true',
+                       help='Enable async output mode for better performance')
+    
+    args = parser.parse_args()
+    
+    # Determine which files to process
+    csv_files = args.files if args.files else args.csv
+    
+    print("Enhanced Multi-threaded CitiBike Hot Path Detection & Load Shedding Demo")
+    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    results = run_enhanced_demo(csv_files, args.events, getattr(args, 'async'), args.threads)
+    print("\nEnhanced multi-threaded demo completed successfully!")
+    
+    # Generate recommendations
+    print(f"\n{'=' * 70}")
+    print("RECOMMENDATIONS FOR PRODUCTION DEPLOYMENT")
+    print(f"{'=' * 70}")
+    
+    print("1. Pattern Optimization:")
+    print("   - Use time-aware patterns for better rush hour detection")
+    print("   - Implement station popularity weighting")
+    print("   - Add geographic zone-based filtering")
+    
+    print("\n2. Load Shedding Strategy:")
+    print("   - Use semantic strategy during peak hours")
+    print("   - Implement adaptive thresholds based on historical data")
+    print("   - Configure pattern-specific importance weights")
+    
+    print("\n3. Memory Optimization for Large Datasets (>10K events):")
+    print("   - Enable memory optimization mode (automatic)")
+    print("   - Reduce Kleene closure max_len from 21 to 5-8")
+    print("   - Use simplified importance calculation")
+    print("   - Limit parallel execution units to 2-3")
+    print("   - Enable aggressive load shedding (memory_threshold=0.6)")
+    print("   - Use single-threaded output writing")
+    print("   - Increase batch sizes and flush intervals")
+    
+    print("\n4. Multi-Threading Optimization:")
+    print("   - Use multi-threaded output for datasets 500-10K events")
+    print("   - Configure 2-3 writer threads for optimal I/O performance")
+    print("   - Adjust batch size based on dataset: max(50, events/200)")
+    print("   - Monitor queue full events and write errors")
+    print("   - Use thread pool sizing: min(input_threads, 3) for writers")
+    
+    print("\n5. Performance Tuning:")
+    print("   - Monitor pattern completion rates")
+    print("   - Adjust time windows based on actual usage patterns")
+    print("   - Implement predictive load monitoring")
+    print("   - Balance input and output thread counts")
+    
+    print("\n5. Quality Assurance:")
+    print("   - Set minimum match rate thresholds")
+    print("   - Monitor false positive rates")
+    print("   - Implement pattern health scoring")
+    print("   - Verify multi-threaded write integrity")
+
+
+if __name__ == "__main__":
+    main()

@@ -48,7 +48,7 @@ class MultiPatternTree:
         Returns True if the given match satisfies the window/confidence constraints of the given pattern
         and False otherwise.
         """
-        if match.last_timestamp - match.first_timestamp > pattern.window:
+        if match.last_timestamp - match.first_timestamp > pattern.window.seconds:
             return False
         return pattern.confidence is None or match.probability is None or match.probability >= pattern.confidence
 
