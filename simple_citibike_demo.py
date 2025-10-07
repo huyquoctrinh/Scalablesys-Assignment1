@@ -125,7 +125,7 @@ class SimpleCitiBikeStream(InputStream):
         logger.info(f"Finished streaming {self.count} events.")
 
     def get_item(self):
-        """El motor CEP llamará a este método para obtener el siguiente evento."""
+        """El motor CEP llamará a este metodo para obtener el siguiente evento."""
         try:
             return next(self._generator)
         except StopIteration:
