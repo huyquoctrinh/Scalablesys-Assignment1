@@ -43,34 +43,36 @@ LOAD_SHEDDING_AVAILABLE = True
 
 class SimpleCitiBikeStream(InputStream):
     """Simple stream wrapper for CitiBike data."""
-    
+
     def __init__(self, csv_file: str, max_events: int = 10000):
-        super().__init__()  # Initialize the parent Stream class
+        super().__init__()
+        self.csv_file = csv_file
         self.formatter = CitiBikeCSVFormatter(csv_file)
         self.max_events = max_events
         self.count = 0
-        
+        self._generator = self._create_generator()
+
         # Load data into the internal queue like FileInputStream does
-        print(f"Loading CitiBike data from {csv_file}...")
-        for data in self.formatter:
-            if self.count >= max_events:
-                break
+        #print(f"Loading CitiBike data from {csv_file}...")
+        # for data in self.formatter:
+        #    if self.count >= max_events:
+        #        break
                 
             # Add load shedding attributes directly to the data
-            data['importance'] = self._get_importance(data)
-            data['priority'] = self._get_priority(data)
-            data['event_type'] = "BikeTrip"
+        #    data['importance'] = self._get_importance(data)
+        #    data['priority'] = self._get_priority(data)
+        #    data['event_type'] = "BikeTrip"
             
             # Put the data into the internal queue
-            self._stream.put(data)
-            self.count += 1
+        #    self._stream.put(data)
+        #    self.count += 1
             
-            if self.count % 100 == 0:  # Log every 100th event during loading
-                print(f"Loaded {self.count}/{max_events} events...")
+        #    if self.count % 100 == 0:  # Log every 100th event during loading
+        #        print(f"Loaded {self.count}/{max_events} events...")
         
         # Close the stream to signal end of data
-        self.close()
-        print(f"Finished loading {self.count} events into stream")
+        #self.close()
+        #print(f"Finished loading {self.count} events into stream")
     
     def _get_importance(self, data):
         """Calculate importance for semantic load shedding."""
@@ -100,6 +102,45 @@ class SimpleCitiBikeStream(InputStream):
             priority += 1.0
         
         return min(10.0, priority)
+
+    def _create_generator(self):
+        logger.info(f"Starting to stream CitiBike data from {self.csv_file}...")
+        for data in self.formatter:
+            if self.count >= self.max_events:
+                break
+
+            # enrich
+            data['importance'] = self._get_importance(data)
+            data['priority']   = self._get_priority(data)
+            data['event_type'] = "BikeTrip"
+
+            self.count += 1
+
+            # (opcional) mini log para ver que fluye el stream
+            if self.count == 1 or (self.count % 1000) == 0:
+                logger.info(f"[STREAM] yielded {self.count} events")
+
+            yield data
+
+        logger.info(f"Finished streaming {self.count} events.")
+
+    def get_item(self):
+        """El motor CEP llamará a este método para obtener el siguiente evento."""
+        try:
+            return next(self._generator)
+        except StopIteration:
+            # Se acabaron los datos
+            self.close()
+            return None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.get_item()
+        if item is None:
+            raise StopIteration
+        return item
 
 
 class SimpleOutputStream(OutputStream):
@@ -137,78 +178,67 @@ class CitiBikeEventTypeClassifier(EventTypeClassifier):
 
 class SimpleCitiBikeDataFormatter(DataFormatter):
     """Simple data formatter for CitiBike events."""
-    
-    def __init__(self):
+    def __init__(self, total_events_hint: int | None = None, log_every: int = 1000):
         super().__init__(CitiBikeEventTypeClassifier())
-        self._temp_data = None  # Temporary storage for passing dict data
-    
+        self.total_hint = total_events_hint
+        self.log_every = max(1, log_every)
+        self._processed = 0
+        self._t0 = time.time()
+        logger.info(f"[PROGRESS-SETUP] log_every={self.log_every}, total_hint={self.total_hint}")
+
+    def _tick_progress(self):
+        self._processed += 1
+        if self._processed == 1 or (self._processed % self.log_every) == 0:
+            elapsed = max(1e-9, time.time() - self._t0)
+            rate = self._processed / elapsed
+            if self.total_hint:
+                pct = 100.0 * self._processed / self.total_hint
+                eta = (self.total_hint - self._processed) / rate if rate > 0 else float("inf")
+                logger.info(f"[PROGRESS] {self._processed}/{self.total_hint} ({pct:.1f}%) — {rate:.0f} ev/s — ETA {eta:.1f}s")
+            else:
+                logger.info(f"[PROGRESS] {self._processed} events — {rate:.0f} ev/s")
+
     def set_temp_data(self, data):
         """Temporary method to store dict data."""
         self._temp_data = data
     
     def parse_event(self, raw_data):
-        """Parse raw data into event payload dictionary."""
-        logger.debug(f"Parsing event data: {type(raw_data)}")
-        
-        # If it's already a dict (from our CitiBike formatter), return it directly
+        self._tick_progress()
+
         if isinstance(raw_data, dict):
-            return raw_data
-        
-        # If it's a string, try to parse it
+            e = dict(raw_data)
+            for col in ("bikeid", "start_station_id", "end_station_id", "tripduration_s"):
+                if col in e:
+                    try: e[col] = int(e[col])
+                    except Exception: pass
+            return e
         if isinstance(raw_data, str):
             import ast
-            if raw_data.startswith("{'") or raw_data.startswith('{"'):
+            if raw_data.startswith("{'") or raw_data.startswith('{\"'):
                 return ast.literal_eval(raw_data)
             else:
                 return {"raw_data": raw_data}
-        
-        # Fallback
         return {"data": str(raw_data)}
 
     def get_event_timestamp(self, event_payload: dict):
-        """Return a datetime (not float) so the engine can do datetime - timedelta."""
         ts = event_payload.get("ts")
-
-        # Ya es datetime → úsalo tal cual
         if isinstance(ts, datetime):
             return ts
-
-        # Cadena ISO → parsear (e.g., '2025-10-03T12:34:56' o '2025-10-03 12:34:56')
         if isinstance(ts, str):
-            # intenta ISO primero
             try:
-                return datetime.fromisoformat(ts.replace('Z', '+00:00'))  # tolera 'Z'
+                return datetime.fromisoformat(ts.replace('Z', '+00:00'))
             except Exception:
-                # fallback común: 'YYYY-MM-DD HH:MM:SS'
                 try:
                     return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
                 except Exception:
-                    pass  # seguiremos a siguiente opción
-
-        # Epoch (int/float) → convertir a datetime
+                    pass
         if isinstance(ts, (int, float)):
             try:
                 return datetime.fromtimestamp(ts)
             except Exception:
                 pass
-
-        # Fallback seguro: ahora
         return datetime.now()
 
-    #def get_event_timestamp(self, event_payload: dict):
-        """Extract timestamp from event payload."""
-        logger.debug(f"Getting timestamp from payload keys: {list(event_payload.keys())}")
-        if "ts" in event_payload:
-            if hasattr(event_payload["ts"], 'timestamp'):
-                # Return the timestamp as a float (seconds since epoch)
-                return event_payload["ts"].timestamp()
-            elif isinstance(event_payload["ts"], datetime):
-                # If it's already a datetime object, convert to timestamp
-                return event_payload["ts"].timestamp()
-            else:
-                return float(event_payload["ts"])
-        return datetime.now().timestamp()
-    
     def format(self, data):
         return str(data)
 
@@ -216,7 +246,8 @@ class AdjacentChainingKC(KCCondition):
     def __init__(self, kleene_var="a",
                  bike_key="bikeid",
                  start_key="start_station_id",
-                 end_key="end_station_id"):
+                 end_key="end_station_id", max_len: int | None = 8):
+        self._max_len = max_len
 
         def _payload(ev):
             if isinstance(ev, dict):
@@ -269,18 +300,14 @@ class AdjacentChainingKC(KCCondition):
 
     def _eval(self, ctx) -> bool:
         seq = self._extract_seq(ctx)
-        if len(seq) <= 1:
+        n = len(seq)
+        if self._max_len and n > self._max_len:
+            return False
+        if n <= 1:
             return True
-        for prev, curr in zip(seq, seq[1:]):
-            p = self._to_payload(prev)
-            c = self._to_payload(curr)
-
-            if str(p.get(self._bike_key)) != str(c.get(self._bike_key)):
-                return False
-            if str(p.get(self._end_key)) != str(c.get(self._start_key)):
-                return False
-        return True
-
+        prev = self._to_payload(seq[-2]); curr = self._to_payload(seq[-1])
+        return (str(prev.get(self._bike_key)) == str(curr.get(self._bike_key))
+                and str(prev.get(self._end_key)) == str(curr.get(self._start_key)))
 
 def create_sample_patterns():
     logger.info("Creating sample patterns...")
@@ -297,7 +324,8 @@ def create_sample_patterns():
         kleene_var="a",
         bike_key="bikeid",
         start_key="start_station_id",
-        end_key="end_station_id"
+        end_key="end_station_id",
+        max_len=8
     )
 
     # same bike between a[last] y b
@@ -308,8 +336,8 @@ def create_sample_patterns():
 
     #b finish in {7,8,9}
     b_ends_in_target = AndCondition(
-        GreaterThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 6),
-        SmallerThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 10)
+        GreaterThanCondition(Variable("b", lambda x: x["end_station_id"]), 6),
+        SmallerThanCondition(Variable("b", lambda x: x["end_station_id"]), 10)
     )
 
     pattern1_condition = AndCondition(
@@ -351,18 +379,12 @@ def run_basic_citibike_test(csv_file: str, max_events: int = 5000):
     
     if LOAD_SHEDDING_AVAILABLE:
         configs = {
-            'No Load Shedding': LoadSheddingConfig(enabled=False),
-            'Conservative': PresetConfigs.conservative(),
             'Semantic (CitiBike-tuned)': LoadSheddingConfig(
                 strategy_name='semantic',
-                pattern_priorities={
-                    'RushHourCommute': 9.0,
-                    'WeekendLeisure': 5.0,
-                    'LongDistanceTrip': 7.0
-                },
+                pattern_priorities={'HotPathDetection': 10.0},
                 importance_attributes=['importance', 'priority'],
-                memory_threshold=0.7,
-                cpu_threshold=0.8
+                memory_threshold=0.6,  # más agresivo
+                cpu_threshold=0.7
             )
         }
     else:
@@ -387,7 +409,10 @@ def run_basic_citibike_test(csv_file: str, max_events: int = 5000):
         # Create streams
         input_stream = SimpleCitiBikeStream(csv_file, max_events)
         output_stream = SimpleOutputStream(f"output_citybike_{config_name.replace(' ', '_').lower()}.txt")
-        data_formatter = SimpleCitiBikeDataFormatter()
+        data_formatter = SimpleCitiBikeDataFormatter(
+            total_events_hint=max_events,  # hint para % y ETA
+            log_every=max(1, max_events // 10)
+        )
         
         # Run processing
         print("  Processing events...")
@@ -497,8 +522,6 @@ def main():
     
     results = run_basic_citibike_test(args.csv, args.events)
     print("\nDemo completed successfully!", results)
-
-
 
 if __name__ == "__main__":
     main()
