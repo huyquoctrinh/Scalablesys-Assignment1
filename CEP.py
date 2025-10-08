@@ -35,7 +35,8 @@ class CEP:
     def __init__(self, patterns, eval_mechanism_params=None,
                  parallel_execution_params: ParallelExecutionParameters = None,
                  pattern_preprocessing_params: PatternPreprocessingParameters = None,
-                 load_shedding_config: Optional['LoadSheddingConfig'] = None):
+                 load_shedding_config: Optional['LoadSheddingConfig'] = None,
+                 eval_mechanism=None):
         """
         Constructor of the class.
         

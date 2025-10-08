@@ -62,11 +62,11 @@ class SimpleCitiBikeStream(InputStream):
             data['event_type'] = "BikeTrip"
             
             # Put the data into the internal queue
-            self._stream.put(data)
+            self._stream.append(data)
             self.count += 1
             
             if self.count % 100 == 0:  # Log every 100th event during loading
-                print(f"Loaded {self.count}/{max_events} events...")
+                print(f"Loaded {self.count}/{self.max_events} events...")
         
         # Close the stream to signal end of data
         self.close()

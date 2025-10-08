@@ -51,7 +51,9 @@ from condition.BaseRelationCondition import EqCondition, GreaterThanCondition, S
 from condition.Condition import Variable
 from condition.CompositeCondition import AndCondition, OrCondition
 from base.PatternStructure import SeqOperator, PrimitiveEventStructure, KleeneClosureOperator
-from loadshedding import LoadSheddingConfig
+from loadshedding.StateAwareTreeBasedEvaluationMechanism import StateAwareTreeBasedEvaluationMechanism
+from loadshedding.PriorityBasedLoadShedding import PriorityBasedLoadShedding
+from tree.PatternMatchStorage import TreeStorageParameters
 from condition.KCCondition import KCCondition
 from parallel.ParallelExecutionParameters import DataParallelExecutionParametersHirzelAlgorithm
 
@@ -208,7 +210,7 @@ class StreamingCitiBikeInputStream(InputStream):
                     data['importance'] = self._simple_importance(data)
                     data['event_type'] = "BikeTrip"
                     
-                    self._stream.put(data)
+                    self._stream.append(data)
                     events_processed += 1
                     window_count += 1
                     
@@ -367,17 +369,12 @@ def run_memory_optimized_demo(csv_files: Union[str, List[str]], max_events: int 
         key="bikeid"
     )
     
-    # Aggressive load shedding for memory protection
-    load_config = LoadSheddingConfig(
-        enabled=True,
-        strategy_name='semantic',
-        pattern_priorities={'MemoryOptimizedHotPath': 8.0},
-        importance_attributes=['importance'],
-        memory_threshold=0.5,  # Very aggressive
-        cpu_threshold=0.6
-    )
-    
-    cep = CEP(patterns, parallel_execution_params=parallel_params, load_shedding_config=load_config)
+    # Use the new stateful load shedding mechanism
+    storage_params = TreeStorageParameters(sort_storage=False, clean_up_interval=10)
+    shedding_strategy = PriorityBasedLoadShedding(max_partial_matches=1000)
+    eval_mechanism = StateAwareTreeBasedEvaluationMechanism(patterns, storage_params, shedding_strategy)
+
+    cep = CEP(patterns, parallel_execution_params=parallel_params, eval_mechanism=eval_mechanism)
     
     # Create optimized streams
     input_stream = StreamingCitiBikeInputStream(
@@ -450,6 +447,7 @@ def run_memory_optimized_demo(csv_files: Union[str, List[str]], max_events: int 
 if __name__ == "__main__":
     # Find data files
     data_patterns = [
+        'citibike_test/*.csv',
         'test_data/*.csv',
         'test_data/201306-citibike-tripdata.csv', 
         'test_data_split/*.csv'
