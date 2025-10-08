@@ -39,6 +39,7 @@ class TrivialTreeBasedEvaluationMechanism(TreeBasedEvaluationMechanism):
             if leaf_type not in leaf_types:
                 leaf_types.add(leaf_type)
                 partial_matches = leaf.get_storage_unit()
+                # print(f"Leaf {leaf} has {len(partial_matches)} partial matches")
                 old_pattern_matches_events.append([pm.events[0] for pm in partial_matches])
 
         # using heap for fast sort of sorted lists

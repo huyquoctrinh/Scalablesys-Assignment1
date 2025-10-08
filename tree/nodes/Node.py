@@ -58,7 +58,7 @@ class Node(ABC):
     ###################################### Initialization
     def __init__(self, pattern_params: PatternParameters, parents, pattern_ids: int or Set[int] = None):
         self._parents = []
-        self._sliding_window = pattern_params.window.seconds
+        self._sliding_window = pattern_params.window
         self._confidence = pattern_params.confidence
         self._partial_matches = None
         self._condition = AndCondition()
@@ -110,7 +110,9 @@ class Node(ABC):
         """
         if not Node._is_partial_match_expiration_enabled():
             return
-        self._partial_matches.try_clean_expired_partial_matches(last_timestamp - self._sliding_window)
+        # print(type(last_timestamp), type(self._sliding_window))
+        # print(last_timestamp, self._sliding_window)
+        self._partial_matches.try_clean_expired_partial_matches(last_timestamp - self._sliding_window.seconds)
         if len(self._single_event_types) == 0:
             # "single" consumption policy is disabled or no event types under the policy reach this node
             return
@@ -191,7 +193,7 @@ class Node(ABC):
         """
         min_timestamp = min([event.min_timestamp for event in events_for_new_match])
         max_timestamp = max([event.max_timestamp for event in events_for_new_match])
-        return max_timestamp - min_timestamp <= self._sliding_window
+        return max_timestamp - min_timestamp <= self._sliding_window.seconds
 
     ###################################### Parent- and topology-related methods
     def get_last_unhandled_partial_match_by_parent(self, parent):
