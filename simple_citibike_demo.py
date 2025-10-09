@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""
-Simple CitiBike Load Shedding Demo
-This script demonstrates load shedding with real CitiBike data in a straightforward way.
-"""
+# Simple CitiBike Baseline (No Load Shedding)
+# SASE pattern:
+#   PATTERN SEQ (BikeTrip+ a[], BikeTrip b)
+#   WHERE a[i+1].bike = a[i].bike
+#     AND a[i+1].start = a[i].end
+#     AND a[last].bike = b.bike
+#     AND b.end in {3165,247,358}
+#   WITHIN 1h
+#   RETURN (a[1].start, a[i].end, b.end)
 
 import os
 import sys
 import time
 import logging
-from datetime import datetime
-from typing import List, Iterator
-from condition.BaseRelationCondition import EqCondition, GreaterThanCondition, SmallerThanCondition
-from condition.Condition import Variable
-from stream.FileStream import FileInputStream, FileOutputStream
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from collections import Counter
+from datetime import datetime, timedelta
+
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,482 +23,352 @@ from city_bike_formatter import CitiBikeCSVFormatter
 from CEP import CEP
 from stream.Stream import InputStream, OutputStream
 from base.DataFormatter import DataFormatter, EventTypeClassifier
-from base.Event import Event
 from base.Pattern import Pattern
-from condition.BaseRelationCondition import BaseRelationCondition
-from condition.CompositeCondition import CompositeCondition
-from condition.KCCondition import KCCondition
-from condition.CompositeCondition import CompositeCondition
-from condition.CompositeCondition import AndCondition
-from base.Event import Event
-from base.Pattern import Pattern
-from stream.Stream import InputStream, OutputStream
-import time
-import os
-from datetime import datetime, timedelta
 from base.PatternStructure import SeqOperator, PrimitiveEventStructure, KleeneClosureOperator
-from loadshedding import LoadSheddingConfig, PresetConfigs
-LOAD_SHEDDING_AVAILABLE = True
+from condition.BaseRelationCondition import EqCondition
+from condition.CompositeCondition import AndCondition, OrCondition
+from condition.Condition import Variable
+from condition.KCCondition import KCCondition
+from condition.KCCondition import KCIndexCondition
+TARGET_END_STATIONS = [3165, 247, 358]
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("citibike-baseline")
 
+# ---------- Raw stream (no LS) ----------
 class SimpleCitiBikeStream(InputStream):
-    """Simple stream wrapper for CitiBike data."""
-    
     def __init__(self, csv_file: str, max_events: int = 10000):
-        super().__init__()  # Initialize the parent Stream class
+        super().__init__()
+        self.csv_file = csv_file
         self.formatter = CitiBikeCSVFormatter(csv_file)
-        self.max_events = max_events
+        self.max_events = int(max_events)
         self.count = 0
-        
-        # Load data into the internal queue like FileInputStream does
-        print(f"Loading CitiBike data from {csv_file}...")
-        for data in self.formatter:
-            if self.count >= max_events:
+        self.target_end_count = 0  # end ∈ {3165,247,358}
+        self._gen = self._create()
+
+    def _create(self):
+        logger.info(f"[STREAM] reading {self.csv_file} (max_events={self.max_events})")
+        for row in self.formatter:
+            if self.count >= self.max_events:
                 break
-                
-            # Add load shedding attributes directly to the data
-            data['importance'] = self._get_importance(data)
-            data['priority'] = self._get_priority(data)
-            data['event_type'] = "BikeTrip"
-            
-            # Put the data into the internal queue
-            self._stream.put(data)
-            self.count += 1
-            
-            if self.count % 100 == 0:  # Log every 100th event during loading
-                print(f"Loaded {self.count}/{max_events} events...")
-        
-        # Close the stream to signal end of data
-        self.close()
-        print(f"Finished loading {self.count} events into stream")
-    
-    def _get_importance(self, data):
-        """Calculate importance for semantic load shedding."""
-        importance = 0.5
-        
-        # Rush hour trips are more important
-        hour = data["ts"].hour
-        if 7 <= hour <= 9 or 17 <= hour <= 19:
-            importance += 0.3
-        
-        # Longer trips are more interesting
-        if data["tripduration_s"] and data["tripduration_s"] > 1800:  # 30+ minutes
-            importance += 0.2
-        
-        return min(1.0, importance)
-    
-    def _get_priority(self, data):
-        """Calculate priority for semantic load shedding."""
-        priority = 5.0
-        
-        # Subscribers have higher priority
-        if data["usertype"] == "Subscriber":
-            priority += 2.0
-        
-        # Weekday commutes are higher priority
-        if data["ts"].weekday() < 5:  # Monday-Friday
-            priority += 1.0
-        
-        return min(10.0, priority)
-
-
-class SimpleOutputStream(OutputStream):
-    """Simple output stream to collect results."""
-    
-    def __init__(self, file_path: str = "output_citybike.txt"):
-        super().__init__()  # Initialize the parent Stream class
-        self.file_path = file_path
-        self.matches = []
-    
-    def add_item(self, item: object):
-        """Add item to both internal list and parent stream."""
-        self.matches.append(item)
-        # Also add to the parent stream's queue
-        super().add_item(item)
-    
-    def get_matches(self):
-        return self.matches
-    
-    def close(self):
-        """Write all matches to file when closing."""
-        super().close()
-        with open(self.file_path, 'w') as f:
-            for match in self.matches:
-                f.write(str(match) + '\n')
-
-
-class CitiBikeEventTypeClassifier(EventTypeClassifier):
-    """Event type classifier for CitiBike events."""
-    
-    def get_event_type(self, event_payload: dict):
-        """All CitiBike events are trip events."""
-        return "BikeTrip"
-
-
-class SimpleCitiBikeDataFormatter(DataFormatter):
-    """Simple data formatter for CitiBike events."""
-    
-    def __init__(self):
-        super().__init__(CitiBikeEventTypeClassifier())
-        self._temp_data = None  # Temporary storage for passing dict data
-    
-    def set_temp_data(self, data):
-        """Temporary method to store dict data."""
-        self._temp_data = data
-    
-    def parse_event(self, raw_data):
-        """Parse raw data into event payload dictionary."""
-        logger.debug(f"Parsing event data: {type(raw_data)}")
-        
-        # If it's already a dict (from our CitiBike formatter), return it directly
-        if isinstance(raw_data, dict):
-            return raw_data
-        
-        # If it's a string, try to parse it
-        if isinstance(raw_data, str):
-            import ast
-            if raw_data.startswith("{'") or raw_data.startswith('{"'):
-                return ast.literal_eval(raw_data)
-            else:
-                return {"raw_data": raw_data}
-        
-        # Fallback
-        return {"data": str(raw_data)}
-
-    def get_event_timestamp(self, event_payload: dict):
-        """Return a datetime (not float) so the engine can do datetime - timedelta."""
-        ts = event_payload.get("ts")
-
-        # Ya es datetime → úsalo tal cual
-        if isinstance(ts, datetime):
-            return ts
-
-        # Cadena ISO → parsear (e.g., '2025-10-03T12:34:56' o '2025-10-03 12:34:56')
-        if isinstance(ts, str):
-            # intenta ISO primero
+            row["event_type"] = "BikeTrip"  # keep types simple
+            # quick count for sanity
             try:
-                return datetime.fromisoformat(ts.replace('Z', '+00:00'))  # tolera 'Z'
-            except Exception:
-                # fallback común: 'YYYY-MM-DD HH:MM:SS'
-                try:
-                    return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass  # seguiremos a siguiente opción
-
-        # Epoch (int/float) → convertir a datetime
-        if isinstance(ts, (int, float)):
-            try:
-                return datetime.fromtimestamp(ts)
+                end_id = int(row.get("end_station_id")) if row.get("end_station_id") is not None else None
+                if end_id in (3165, 247, 358):
+                    self.target_end_count += 1
             except Exception:
                 pass
 
-        # Fallback seguro: ahora
-        return datetime.now()
+            self.count += 1
+            if self.count == 1 or (self.count % max(1, self.max_events // 50) == 0):
+                logger.info(f"[STREAM] yielded {self.count} events")
+            yield row
 
-    #def get_event_timestamp(self, event_payload: dict):
-        """Extract timestamp from event payload."""
-        logger.debug(f"Getting timestamp from payload keys: {list(event_payload.keys())}")
-        if "ts" in event_payload:
-            if hasattr(event_payload["ts"], 'timestamp'):
-                # Return the timestamp as a float (seconds since epoch)
-                return event_payload["ts"].timestamp()
-            elif isinstance(event_payload["ts"], datetime):
-                # If it's already a datetime object, convert to timestamp
-                return event_payload["ts"].timestamp()
+        logger.info(f"[STREAM] finished: yielded {self.count} events; end∈{{3165,247,358}}≈{self.target_end_count}")
+
+    def get_item(self):
+        try:
+            return next(self._gen)
+        except StopIteration:
+            self.close()
+            return None
+
+    def __iter__(self): return self
+    def __next__(self):
+        item = self.get_item()
+        if item is None: raise StopIteration
+        return item
+
+# ---------- Output collector ----------
+class SimpleOutputStream(OutputStream):
+    def __init__(self, file_path: str = "output_citybike_baseline.txt"):
+        super().__init__()
+        self.file_path = file_path
+        self._matches = []
+
+    def add_item(self, item: object):
+        self._matches.append(item)
+        super().add_item(item)
+
+    def get_matches(self): return self._matches
+
+    def close(self):
+        super().close()
+        with open(self.file_path, "w", encoding="utf-8") as f:
+            for m in self._matches:
+                f.write(str(m) + "\n")
+
+# ---------- Formatter ----------
+class CitiBikeEventTypeClassifier(EventTypeClassifier):
+    def get_event_type(self, event_payload: dict):
+        return event_payload.get("event_type") or "BikeTrip"
+
+class SimpleCitiBikeDataFormatter(DataFormatter):
+    def __init__(self, total_events_hint: int | None = None, log_every: int | None = None):
+        super().__init__(CitiBikeEventTypeClassifier())
+        self.total_hint = total_events_hint
+        self.log_every = int(log_every) if log_every else (max(1, (self.total_hint or 100000) // 100))
+        self._n = 0
+        self._t0 = time.time()
+        logger.info(f"[FORMATTER] log_every={self.log_every}, total_hint={self.total_hint}")
+
+    def _progress(self):
+        self._n += 1
+        if self._n == 1 or (self._n % self.log_every) == 0:
+            dt = max(1e-9, time.time() - self._t0)
+            rate = self._n / dt
+            if self.total_hint:
+                pct = 100.0 * self._n / self.total_hint
+                logger.info(f"[PROGRESS] {self._n}/{self.total_hint} ({pct:.1f}%) — {rate:.0f} ev/s")
             else:
-                return float(event_payload["ts"])
-        return datetime.now().timestamp()
-    
-    def format(self, data):
-        return str(data)
+                logger.info(f"[PROGRESS] {self._n} events — {rate:.0f} ev/s")
 
-class AdjacentChainingKC(KCCondition):
-    def __init__(self, kleene_var="a",
-                 bike_key="bikeid",
-                 start_key="start_station_id",
-                 end_key="end_station_id"):
+    def parse_event(self, raw_data):
+        self._progress()
+        e = dict(raw_data) if isinstance(raw_data, dict) else {"raw": str(raw_data)}
 
-        def _payload(ev):
-            if isinstance(ev, dict):
-                return ev
-            p = getattr(ev, "payload", None)
-            if p is not None:
-                return p
-            gp = getattr(ev, "get_payload", None)
-            return gp() if callable(gp) else ev
+        # normalize ints
+        def as_int(k):
+            if k in e and e[k] is not None:
+                try: e[k] = int(e[k])
+                except: pass
+        for col in ("bikeid", "start_station_id", "end_station_id", "tripduration_s"):
+            as_int(col)
 
-        def _to_int(v):
+        # normalize timestamp
+        ts = e.get("ts")
+        if isinstance(ts, str):
             try:
-                return int(v)
+                ts = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
             except Exception:
-                return v  # si no es convertible, lo dejamos tal cual
+                try:
+                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    ts = None
+        e["ts"] = ts if ts is not None else datetime.now()
+        return e
 
+    def get_event_timestamp(self, event_payload: dict):
+        ts = event_payload.get("ts")
+        if isinstance(ts, datetime): return ts
+        try: return datetime.fromisoformat(str(ts))
+        except: return datetime.now()
+
+    def format(self, data): return str(data)
+
+# ---------- KCCondition: adjacency inside a[] ----------
+class AdjacentChainingKC(KCCondition):
+    # a[i+1].bike == a[i].bike  AND  a[i+1].start == a[i].end
+    def __init__(self, kleene_var="a", bike_key="bikeid", start_key="start_station_id", end_key="end_station_id"):
         def getattr_func(ev):
-            p = _payload(ev)
-            # tuple: (bike, start, end) con cast a int si es posible
-            return (_to_int(p.get(bike_key)),
-                    _to_int(p.get(start_key)),
-                    _to_int(p.get(end_key)))
+            p = ev if isinstance(ev, dict) else getattr(ev, "payload", ev)
+            def to_int(v):
+                try: return int(v)
+                except: return v
+            return (to_int(p.get(bike_key)), to_int(p.get(start_key)), to_int(p.get(end_key)))
 
         def relation_op(prev_tuple, curr_tuple):
-            # misma bici + encadenamiento
             return (prev_tuple[0] == curr_tuple[0]) and (prev_tuple[2] == curr_tuple[1])
 
-        super().__init__(kleene_var, getattr_func, relation_op)
+        # IMPORTANT: KCCondition expects a SET of names
+        super().__init__({kleene_var}, getattr_func, relation_op)
 
-        self._kleene_var = kleene_var
-        self._bike_key = bike_key
-        self._start_key = start_key
-        self._end_key = end_key
-
-    def _to_payload(self, e):
-        if isinstance(e, dict):
-            return e
-        p = getattr(e, "payload", None)
-        if p is not None:
-            return p
-        gp = getattr(e, "get_payload", None)
-        return gp() if callable(gp) else e
-
-    def _extract_seq(self, ctx):
-        if isinstance(ctx, list):
-            return ctx
-        if isinstance(ctx, dict):
-            return ctx.get(self._kleene_var) or ctx.get("a") or []
-        return []
-
-    def _eval(self, ctx) -> bool:
-        seq = self._extract_seq(ctx)
-        if len(seq) <= 1:
+    def _eval(self, event_list: list = None):
+        # True si hay 0/1 eventos (no hay parejas que romper), si no, comprobar todas las adyacencias
+        if not event_list or len(event_list) < 2:
             return True
-        for prev, curr in zip(seq, seq[1:]):
-            p = self._to_payload(prev)
-            c = self._to_payload(curr)
-
-            if str(p.get(self._bike_key)) != str(c.get(self._bike_key)):
+        prev = self._getattr_func(event_list[0])
+        for ev in event_list[1:]:
+            curr = self._getattr_func(ev)
+            if not self._relation_op(prev, curr):
                 return False
-            if str(p.get(self._end_key)) != str(c.get(self._start_key)):
-                return False
+            prev = curr
         return True
 
-
-def create_sample_patterns():
-    logger.info("Creating sample patterns...")
-    patterns = []
-
-    # SEQ( BikeTrip+ a[], BikeTrip b )
-    pattern1_structure = SeqOperator(
-        KleeneClosureOperator(PrimitiveEventStructure("BikeTrip", "a")),  # a[] with Kleene +
-        PrimitiveEventStructure("BikeTrip", "b")                          # b
+# ---------- Build the exact pattern ----------
+def build_pattern():
+    structure = SeqOperator(
+        KleeneClosureOperator(PrimitiveEventStructure("BikeTrip", "a")),
+        PrimitiveEventStructure("BikeTrip", "b")
     )
 
-    # chain a[]
-    chain_inside_a = AdjacentChainingKC(
-        kleene_var="a",
-        bike_key="bikeid",
-        start_key="start_station_id",
-        end_key="end_station_id"
-    )
+    # --- helpers robustos ---
+    def _payload(e):
+        return e if isinstance(e, dict) else getattr(e, "payload", e)
 
-    # same bike between a[last] y b
+    def _get_int(p, *keys):
+        """Int tolerante: usa el primer key presente; acepta '123', '123.0', etc."""
+        for k in keys:
+            if k in p and p[k] is not None:
+                try:
+                    return int(p[k])
+                except Exception:
+                    try:
+                        s = str(p[k]).strip()
+                        if s == "" or s.lower() == "nan":
+                            continue
+                        return int(float(s))
+                    except Exception:
+                        continue
+        return -10**12  # sentinel imposible para no igualar por accidente
+
+    def _a_last_bike(a_binding):
+        ev = a_binding[-1] if isinstance(a_binding, (list, tuple)) and a_binding else a_binding
+        p = _payload(ev)
+        return _get_int(p, "bikeid")
+
+    def _b_bike(b_binding):
+        p = _payload(b_binding)
+        return _get_int(p, "bikeid")
+
+    def _b_end(b_binding):
+        p = _payload(b_binding)
+        # soporta ambas variantes de nombre
+        return _get_int(p, "end_station_id", "end station id")
+
+    # --- KC: adyacencia dentro de a[]: mismo bike y end == next start ---
+    debug_seen = {"n": 0}  # ← contador local para debug
+
+    def _attr(ev):
+        p = _payload(ev)
+        bike = _get_int(p, "bikeid")
+        start = _get_int(p, "start_station_id", "start station id")
+        end = _get_int(p, "end_station_id", "end station id")
+
+        # DEBUG (primeras 6 muestras)
+        if debug_seen["n"] < 6:
+            print(f"[KC attr] bike={bike} start={start} end={end}")
+            debug_seen["n"] += 1
+
+        return (bike, start, end)
+
+    def _adj(prev_tuple, curr_tuple):
+        return (prev_tuple[0] == curr_tuple[0]) and (prev_tuple[2] == curr_tuple[1])
+
+    chain_inside_a = KCIndexCondition({"a"}, _attr, _adj, offset=1)
+
+    # --- a[last].bike == b.bike ---
     same_bike_last_a_b = EqCondition(
-        Variable("a", lambda x: x["bikeid"]),
-        Variable("b", lambda x: x["bikeid"])
+        Variable("a", _a_last_bike),
+        Variable("b", _b_bike)
     )
 
-    #b finish in {7,8,9}
-    b_ends_in_target = AndCondition(
-        GreaterThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 6),
-        SmallerThanCondition(Variable("b", lambda x: int(x["end_station_id"])), 10)
-    )
+    # --- b.end ∈ TARGET_END_STATIONS ---
+    targets = list(TARGET_END_STATIONS)
+    conds = [EqCondition(Variable("b", _b_end), v) for v in targets]
+    if not conds:
+        b_end_is_target = EqCondition(Variable("b", _b_end), -1)  # imposible
+    else:
+        orc = conds[0]
+        for nxt in conds[1:]:
+            orc = OrCondition(orc, nxt)
+        b_end_is_target = orc
 
-    pattern1_condition = AndCondition(
-        chain_inside_a,
-        same_bike_last_a_b,
-        b_ends_in_target
-    )
+    cond = AndCondition(chain_inside_a, same_bike_last_a_b, b_end_is_target)
+    pattern = Pattern(structure, cond, timedelta(hours=1))
+    pattern.name = "HotPathDetection"
+    return pattern
 
-    pattern1 = Pattern(
-        pattern1_structure,
-        pattern1_condition,
-        timedelta(hours=1)
-    )
-    pattern1.name = "HotPathDetection"
-    patterns.append(pattern1)
+# ---------- Helpers for nice samples ----------
+def extract_tuple_from_match(m):
+    """Return (a[1].start, a[last].end, b.end) if possible; else None."""
+    def payload(e):
+        if e is None: return None
+        if isinstance(e, dict): return e
+        return getattr(e, "payload", e)
 
-    logger.info(f"Created {len(patterns)} patterns")
-    return patterns
+    try:
+        a_seq = None; b_ev = None
+        if isinstance(m, dict):
+            a_seq = m.get("a"); b_ev = m.get("b")
+        else:
+            try: a_seq, b_ev = m["a"], m["b"]
+            except Exception:
+                a_seq = getattr(m, "a", None); b_ev = getattr(m, "b", None)
+        if not a_seq or b_ev is None: return None
+        if not isinstance(a_seq, (list, tuple)): a_seq = [a_seq]
+        a1 = payload(a_seq[0]); al = payload(a_seq[-1]); b = payload(b_ev)
+        return (int(a1["start_station_id"]), int(al["end_station_id"]), int(b["end_station_id"]))
+    except Exception:
+        return None
 
-def run_basic_citibike_test(csv_file: str, max_events: int = 5000):
-    """Run basic CitiBike load shedding test."""
-    
+# ---------- Runner ----------
+def run(csv_file: str, max_events: int):
     if not os.path.exists(csv_file):
         print(f"Error: CSV file not found: {csv_file}")
+        print("Please ensure the file exists and the path is correct.")
         return
-    
-    print("=" * 60)
-    print("CITIBIKE LOAD SHEDDING DEMONSTRATION")
-    print("=" * 60)
-    print(f"Data file: {csv_file}")
-    print(f"Max events: {max_events}")
-    print(f"Load shedding available: {LOAD_SHEDDING_AVAILABLE}")
-    
-    # Create patterns
-    patterns = create_sample_patterns()
-    
-    # Test configurations
-    configs = {}
-    
-    if LOAD_SHEDDING_AVAILABLE:
-        configs = {
-            'No Load Shedding': LoadSheddingConfig(enabled=False),
-            'Conservative': PresetConfigs.conservative(),
-            'Semantic (CitiBike-tuned)': LoadSheddingConfig(
-                strategy_name='semantic',
-                pattern_priorities={
-                    'RushHourCommute': 9.0,
-                    'WeekendLeisure': 5.0,
-                    'LongDistanceTrip': 7.0
-                },
-                importance_attributes=['importance', 'priority'],
-                memory_threshold=0.7,
-                cpu_threshold=0.8
-            )
-        }
-    else:
-        configs = {'No Load Shedding': None}
-    
-    results = {}
-    
-    for config_name, config in configs.items():
-        print(f"\nTesting: {config_name}")
-        print("-" * 40)
-        
-        logger.info(f"Creating CEP instance for {config_name}")
-        # Create CEP instance
-        if LOAD_SHEDDING_AVAILABLE and config:
-            logger.info(f"Using load shedding config: {config}")
-            cep = CEP(patterns, load_shedding_config=config)
-        else:
-            logger.info("Creating CEP without load shedding")
-            cep = CEP(patterns)
-        
-        logger.info("Creating streams and data formatter")
-        # Create streams
-        input_stream = SimpleCitiBikeStream(csv_file, max_events)
-        output_stream = SimpleOutputStream(f"output_citybike_{config_name.replace(' ', '_').lower()}.txt")
-        data_formatter = SimpleCitiBikeDataFormatter()
-        
-        # Run processing
-        print("  Processing events...")
-        logger.info("Starting CEP processing...")
-        start_time = time.time()
-        
-        logger.info("Calling cep.run()...")
-        duration = cep.run(input_stream, output_stream, data_formatter)
-        end_time = time.time()
-        logger.info(f"CEP processing completed in {duration:.2f} seconds")
-        
-        print(f"  ✓ Completed in {duration:.2f} seconds")
-        print(f"  ✓ Wall clock time: {end_time - start_time:.2f} seconds")
-        print(f"  ✓ Events processed: {input_stream.count}")
-        print(f"  ✓ Matches found: {len(output_stream.get_matches())}")
-        
-        # Get load shedding statistics
-        if cep.is_load_shedding_enabled():
-            stats = cep.get_load_shedding_statistics()
-            if stats:
-                print(f"  ✓ Load shedding strategy: {stats['strategy']}")
-                print(f"  ✓ Events dropped: {stats['events_dropped']}")
-                print(f"  ✓ Drop rate: {stats['drop_rate']:.1%}")
-                print(f"  ✓ Current load level: {stats.get('current_load_level', 'unknown')}")
-                print(f"  ✓ Average throughput: {stats.get('avg_throughput_eps', 0):.2f} EPS")
-                
-                results[config_name] = {
-                    'success': True,
-                    'duration': duration,
-                    'wall_clock': end_time - start_time,
-                    'events_processed': input_stream.count,
-                    'matches_found': len(output_stream.get_matches()),
-                    'load_shedding': stats
-                }
-            else:
-                print("  ! Load shedding statistics not available")
-        else:
-            print("  ✓ Load shedding: Disabled")
-            results[config_name] = {
-                'success': True,
-                'duration': duration,
-                'wall_clock': end_time - start_time,
-                'events_processed': input_stream.count,
-                'matches_found': len(output_stream.get_matches()),
-                'load_shedding': None
-            }
-    
-    # Print summary
+
+    logger.info("=" * 72)
+    logger.info("CITIBIKE BASELINE — correctness-only (no load shedding)")
+    logger.info("=" * 72)
+    logger.info(f"CSV: {csv_file}")
+    logger.info(f"Max events: {max_events}")
+
+    cep = CEP([build_pattern()])  # NO LS config passed
+    input_stream = SimpleCitiBikeStream(csv_file, max_events)
+    output_stream = SimpleOutputStream("output_citybike_baseline.txt")
+    formatter = SimpleCitiBikeDataFormatter(total_events_hint=max_events, log_every=max(1, max_events // 100))
+
+    t0 = time.time()
+    duration = cep.run(input_stream, output_stream, formatter)
+    wall = time.time() - t0
+
+    n_events = input_stream.count
+    n_matches = len(output_stream.get_matches())
+    eps = (n_events / duration) if duration > 0 else 0.0
+
     print("\n" + "=" * 60)
-    print("SUMMARY")
+    print("RUN SUMMARY (baseline)")
     print("=" * 60)
-    
-    for config_name, result in results.items():
-        print(f"\n{config_name}:")
-        if result['success']:
-            print(f"  Duration: {result['duration']:.2f}s")
-            print(f"  Events: {result['events_processed']}")
-            print(f"  Matches: {result['matches_found']}")
-            
-            if result['load_shedding']:
-                print(f"  Drop Rate: {result['load_shedding']['drop_rate']:.1%}")
-                print(f"  Strategy: {result['load_shedding']['strategy']}")
-        else:
-            print(f"  Error: {result['error']}")
-    
-    # Performance comparison
-    if len([r for r in results.values() if r['success']]) > 1:
-        print(f"\nPERFORMANCE COMPARISON:")
-        print("-" * 25)
-        
-        successful_results = [(name, result) for name, result in results.items() if result['success']]
-        baseline = successful_results[0][1]  # Use first successful as baseline
-        
-        for name, result in successful_results[1:]:
-            if result['load_shedding']:
-                drop_rate = result['load_shedding']['drop_rate']
-                time_ratio = result['duration'] / baseline['duration']
-                print(f"  {name}:")
-                print(f"    Time vs baseline: {time_ratio:.2f}x")
-                print(f"    Events dropped: {drop_rate:.1%}")
-                print(f"    Matches preserved: {result['matches_found']}/{baseline['matches_found']}")
-    
-    return results
+    print(f"CSV file           : {csv_file}")
+    print(f"Events processed   : {n_events}")
+    print(f"Events end∈{{3165,247,358}}: {input_stream.target_end_count}")
+    print(f"Matches found      : {n_matches}")
+    print(f"Engine time        : {duration:.2f}s")
+    print(f"Wall-clock time    : {wall:.2f}s")
+    print(f"Avg throughput     : {eps:.0f} ev/s")
+    print("Load shedding      : Disabled")
+
+    # Top-5 (a[1].start, b.end) pairs + a few sample full triples
+    pair_counter = Counter()
+    sample = []
+    for m in output_stream.get_matches():
+        tup = extract_tuple_from_match(m)
+        if tup is None: continue
+        a1_start, _al_end, b_end = tup
+        pair_counter[(a1_start, b_end)] += 1
+        if len(sample) < 5: sample.append(tup)
+
+    if pair_counter:
+        print("\nTop 5 (a[1].start, b.end) pairs:")
+        for (s, e), c in pair_counter.most_common(5):
+            print(f"  ({s}, {e}) -> {c} matches")
+
+    if sample:
+        print("\nSample matches (a[1].start, a[last].end, b.end):")
+        for t in sample:
+            print(f"  {t}")
+
+    print("\nOutput written to: output_citybike_baseline.txt")
 
 
 def main():
-    """Main function."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='CitiBike Load Shedding Demo')
-    parser.add_argument('--csv', default='201309-citibike-tripdata.csv',
-                       help='Path to CitiBike CSV file')
-    parser.add_argument('--events', type=int, default=1000,
-                       help='Maximum number of events to process')
-    
-    args = parser.parse_args()
-    
-    # Check if file exists
+    import argparse, os
+    p = argparse.ArgumentParser(description="CitiBike baseline (no load shedding)")
+    # ← valor por defecto para no tener que pasar --csv
+    p.add_argument("--csv", default="201810-citibike-tripdata_hot.csv",
+                   help="Path to CitiBike CSV file (defaults to 201810-citibike-tripdata_hot.csv)")
+    p.add_argument("--events", type=int, default=25,
+                   help="Max events to process")
+    args = p.parse_args()
+
     if not os.path.exists(args.csv):
         print(f"Error: CitiBike CSV file not found: {args.csv}")
-        print("Please ensure the file exists and the path is correct.")
-        print("Example: python simple_citibike_demo.py --csv /path/to/201309-citibike-tripdata.csv")
+        print("Place '201810-citibike-tripdata.csv' in the project folder or pass --csv PATH")
         return
-    
-    print("Simple CitiBike Load Shedding Demo")
-    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    results = run_basic_citibike_test(args.csv, args.events)
-    print("\nDemo completed successfully!", results)
 
-
-
+    run(args.csv, args.events)
 if __name__ == "__main__":
     main()

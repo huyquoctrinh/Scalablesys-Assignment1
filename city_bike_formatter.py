@@ -45,7 +45,13 @@ class CitiBikeCSVFormatter:
                 }
 
                 # Timestamp for CEP: use trip starttime
-                ts = datetime.strptime(event["starttime"], "%Y-%m-%d %H:%M:%S")
+                s = str(event["starttime"]).strip('"').strip()
+                # intenta con microsegundos y, si no, sin microsegundos
+                try:
+                    ts = datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f")
+                except ValueError:
+                    ts = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+
                 if self.tzinfo:
                     ts = ts.replace(tzinfo=self.tzinfo)
                 event["ts"] = ts
