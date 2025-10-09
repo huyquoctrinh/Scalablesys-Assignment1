@@ -67,7 +67,7 @@ class TreeBasedEvaluationMechanism(EvaluationMechanism, ABC):
         # print("Number of event types listened to:", len(self._event_types_listeners))
         for raw_event in events:
             event_count += 1
-            print(f"Processing raw event #{event_count}: {raw_event}")
+            # print(f"Processing raw event #{event_count}: {raw_event}")
             event = Event(raw_event, data_formatter)
             if event.type not in self._event_types_listeners:
                 continue
