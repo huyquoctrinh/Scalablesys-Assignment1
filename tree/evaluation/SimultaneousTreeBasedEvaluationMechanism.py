@@ -70,6 +70,7 @@ class SimultaneousTreeBasedEvaluationMechanism(TreeBasedEvaluationMechanism):
 
     def _get_matches(self, matches: OutputStream):
         super()._get_matches(matches)
+        print("SimultaneousTreeBasedEvaluationMechanism: Getting matches:", self.__is_simultaneous_state)
         if self.__is_simultaneous_state:
             # Flush the matches from the new tree while in simultaneous state
             # These matches were necessarily obtained from the old tree

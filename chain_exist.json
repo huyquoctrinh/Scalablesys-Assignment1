@@ -1,0 +1,16 @@
+{
+  "citybike_dataset/201801-citibike-tripdata.csv": 37721,
+  "citybike_dataset/201802-citibike-tripdata.csv": 47760,
+  "citybike_dataset/201803-citibike-tripdata.csv": 52359,
+  "citybike_dataset/201804-citibike-tripdata.csv": 78926,
+  "citybike_dataset/201804-citibike-tripdata_1.csv": 58128,
+  "citybike_dataset/201804-citibike-tripdata_2.csv": 2618,
+  "citybike_dataset/201805-citibike-tripdata.csv": 111935,
+  "citybike_dataset/201806-citibike-tripdata.csv": 127472,
+  "citybike_dataset/201807-citibike-tripdata.csv": 127802,
+  "citybike_dataset/201808-citibike-tripdata.csv": 140205,
+  "citybike_dataset/201809-citibike-tripdata.csv": 128901,
+  "citybike_dataset/201810-citibike-tripdata.csv": 136864,
+  "citybike_dataset/201811-citibike-tripdata.csv": 68142,
+  "citybike_dataset/201812-citibike-tripdata.csv": 46084
+}
